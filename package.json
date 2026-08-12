@@ -1,0 +1,40 @@
+{
+  "name": "pi-permission-gate",
+  "version": "0.1.0",
+  "description": "LLM-powered safety gate for pi: classifies bash and MCP tool calls by risk before execution, with CWD-aware judgments.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "permission-gate",
+    "safety",
+    "coding-agent",
+    "llm"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": null,
+  "pi": {
+    "extensions": [
+      "./pi-permission-gate.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "tsx": "^4.21.0",
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "scripts": {
+    "test": "node --import tsx --test pi-permission-gate.test.mjs"
+  },
+  "files": [
+    "pi-permission-gate.ts",
+    "README.md",
+    "LICENSE"
+  ]
+}
