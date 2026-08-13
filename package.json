@@ -1,5 +1,5 @@
 {
-  "name": "pi-permission-gate",
+  "name": "@johansja/pi-permission-gate",
   "version": "0.1.0",
   "description": "LLM-powered safety gate for pi: classifies bash and MCP tool calls by risk before execution, with CWD-aware judgments.",
   "keywords": [
@@ -11,6 +11,15 @@
     "llm"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/johansja/pi-permission-gate.git"
+  },
+  "author": "johansja",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "type": "module",
   "main": null,
   "pi": {

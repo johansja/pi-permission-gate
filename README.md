@@ -5,13 +5,19 @@ LLM-powered safety gate for [pi](https://github.com/earendil-works/pi). Instead 
 ## Install
 
 ```bash
+pi install npm:@johansja/pi-permission-gate
+```
+
+Or from git (pinned-ref friendly):
+
+```bash
 pi install git:github.com/johansja/pi-permission-gate
 ```
 
 Try without installing:
 
 ```bash
-pi -e git:github.com/johansja/pi-permission-gate
+pi -e npm:@johansja/pi-permission-gate
 ```
 
 Update:
