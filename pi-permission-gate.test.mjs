@@ -400,16 +400,21 @@ describe("risk level comparison logic", () => {
 // ---------------------------------------------------------------------------
 
 describe("config plumbing", () => {
-	it("references PI_PERM_GATE_MAX_TOKENS env var", () => {
-		assert.match(extensionSource, /PI_PERM_GATE_MAX_TOKENS/);
+	it("does NOT reference any PI_PERM_GATE env var (env tier removed)", () => {
+		assert.doesNotMatch(extensionSource, /PI_PERM_GATE/);
 	});
 
-	it("references PI_PERM_GATE_TEMPERATURE env var", () => {
-		assert.match(extensionSource, /PI_PERM_GATE_TEMPERATURE/);
+	it("default maxTokens is 4096 (raised from 128)", () => {
+		assert.match(extensionSource, /settings\.maxTokens \?\? 4096/);
 	});
 
-	it("references PI_PERM_GATE_TIMEOUT env var", () => {
-		assert.match(extensionSource, /PI_PERM_GATE_TIMEOUT/);
+	it("thinkingLevel setting is read and passed as reasoning", () => {
+		assert.match(extensionSource, /settings\.thinkingLevel/);
+		assert.match(extensionSource, /reasoning: thinkingLevel/);
+	});
+
+	it("fallback setting is validated against allow/block/confirm", () => {
+		assert.match(extensionSource, /FALLBACK_LEVELS/);
 	});
 
 	it("has readPermissionGateConfig function (consolidated single read)", () => {
@@ -551,10 +556,6 @@ describe("CWD-aware system prompt content", () => {
 
 	it("classifyCommand has CWD fallback guard", () => {
 		assert.match(extensionSource, /if \(!cwd\)\s*\{\s*cwd = process\.cwd\(\)/);
-	});
-
-	it("does NOT include CWD_MAX_RISK env var (LLM-only approach)", () => {
-		assert.doesNotMatch(extensionSource, /PI_PERM_GATE_CWD_MAX_RISK/);
 	});
 
 	it("does NOT include isCwdScoped heuristic", () => {

@@ -19,29 +19,35 @@
  *   as less risky than system-wide equivalents. No post-check heuristics
  *   or risk-downgrading logic — the LLM makes CWD-aware judgments directly.
  *
- * Configuration (precedence: env var > settings.json > default):
+ * Configuration (precedence: settings.json > default):
  *
  *   ~/.pi/agent/settings.json "permissionGate" block:
  *     {
  *       "permissionGate": {
  *         "model": "anthropic/claude-sonnet-4-5",
  *         "blockLevel": "low",
- *         "maxTokens": 128,
+ *         "maxTokens": 4096,
  *         "temperature": 0,
- *         "timeout": 10000
+ *         "timeout": 10000,
+ *         "thinkingLevel": "low"
  *       }
  *     }
  *
- *   Environment variables (override settings.json):
- *   PI_PERM_GATE_MODEL       - Model for classification (format: "provider/modelId")
- *   PI_PERM_GATE_BLOCK_LEVEL - Minimum risk level to block: "low" | "medium" | "high" (default: "low")
+ *   Fields:
+ *   model        - Model for classification (format: "provider/modelId" or bare id; default: session model)
+ *   blockLevel   - Minimum risk level to block: "low" | "medium" | "high" (default: "low")
  *     "low"    = block on any risk (safest, most confirmations)
  *     "medium" = block on medium and high risk
  *     "high"   = only block on high risk (fewest confirmations)
- *   PI_PERM_GATE_TIMEOUT     - Timeout in ms for the LLM call (default: 10000)
- *   PI_PERM_GATE_FALLBACK    - What to do if LLM fails: "allow" | "block" | "confirm" (default: "confirm")
- *   PI_PERM_GATE_MAX_TOKENS  - Maximum tokens for the LLM classification call (default: 128)
- *   PI_PERM_GATE_TEMPERATURE - Sampling temperature for classification, e.g. 0 or 0.1 (optional)
+ *   timeout      - Timeout in ms for the LLM call (default: 10000)
+ *   fallback     - What to do if LLM fails: "allow" | "block" | "confirm" (default: "confirm")
+ *   maxTokens    - Maximum tokens for the LLM classification call (default: 4096)
+ *   temperature  - Sampling temperature for classification, e.g. 0 or 0.1 (optional)
+ *   thinkingLevel - Reasoning effort passed to the classifier as `reasoning`:
+ *     "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" (optional).
+ *     Passed through pi-ai's clampThinkingLevel; no-op on models whose
+ *     thinkingLevelMap floors every level (e.g. bitdeerai DeepSeek-V4-Pro
+ *     maps low/medium/high -> "high"). Omit to let the model run its default.
  */
 
 import {
@@ -54,6 +60,8 @@ import {
 	type Model,
 	type Api,
 	type Context,
+	type ThinkingLevel,
+	type ModelThinkingLevel,
 	contentText,
 	parseJsonWithRepair,
 } from "@earendil-works/pi-ai";
@@ -356,7 +364,11 @@ interface PermissionGateConfig {
 	maxTokens?: number;
 	temperature?: number;
 	timeout?: number;
+	fallback?: "allow" | "block" | "confirm";
+	thinkingLevel?: ModelThinkingLevel;
 }
+
+const FALLBACK_LEVELS = ["allow", "block", "confirm"] as const;
 
 function readPermissionGateConfig(cwd: string, agentDir: string): PermissionGateConfig {
 	const settingsManager = SettingsManager.create(cwd, agentDir);
@@ -372,11 +384,20 @@ function readPermissionGateConfig(cwd: string, agentDir: string): PermissionGate
 	if (typeof gate.maxTokens === "number") config.maxTokens = gate.maxTokens;
 	if (typeof gate.temperature === "number") config.temperature = gate.temperature;
 	if (typeof gate.timeout === "number") config.timeout = gate.timeout;
+	if (typeof gate.fallback === "string" && FALLBACK_LEVELS.includes(gate.fallback as "allow" | "block" | "confirm")) {
+		config.fallback = gate.fallback as "allow" | "block" | "confirm";
+	}
+	// thinkingLevel is not validated against a static list. pi-ai's
+	// clampThinkingLevel(model, level) clamps to the model's supported levels
+	// at the provider layer, so any ModelThinkingLevel string is safe here.
+	if (typeof gate.thinkingLevel === "string") {
+		config.thinkingLevel = gate.thinkingLevel as ModelThinkingLevel;
+	}
 	return config;
 }
 
 /**
- * Resolve a model from PI_PERM_GATE_MODEL env var or settings.json.
+ * Resolve a model from the permissionGate.model setting.
  * Accepts "provider/modelId" format (e.g., "anthropic/claude-sonnet-4-5")
  * or a bare model id that's searched across providers.
  * Returns undefined if no model is configured (caller should fall back to ctx.model).
@@ -436,7 +457,7 @@ async function classifyCommand(
 	modelRegistry: ModelRegistry,
 	timeout: number,
 	signal: AbortSignal | undefined,
-	options: { maxTokens?: number; temperature?: number },
+	options: { maxTokens?: number; temperature?: number; reasoning?: ModelThinkingLevel },
 ): Promise<{ verdict: Verdict; rawResponse: string }> {
 	// Fallback to process CWD if ctx.cwd is missing
 	if (!cwd) {
@@ -474,8 +495,14 @@ async function classifyCommand(
 	}
 
 	try {
+		// `reasoning` carries a ModelThinkingLevel ("off"|"minimal"|...|"max").
+		// SimpleStreamOptions.reasoning is typed as ThinkingLevel (no "off"), but
+		// pi-ai's runtime — clampThinkingLevel + the openai-completions
+		// reasoningEffort derivation — accepts "off" and maps it to no
+		// reasoning_effort sent. Cast bridges the narrower TS type.
 		const response = await modelRegistry.complete(model, context, {
 			...options,
+			reasoning: options.reasoning as ThinkingLevel | undefined,
 			signal: timeoutController.signal,
 		});
 
@@ -738,35 +765,21 @@ export default function (pi: ExtensionAPI) {
 					: "mcp")
 				: event.toolName;
 
-		// Load settings: env var > settings.json > default. Read settings once;
-		// each field keeps its own env-var-first derivation.
+		// Load settings: settings.json > default. Read once; derive each field.
 		const settings = readPermissionGateConfig(ctx.cwd, `${process.env.HOME}/.pi/agent`);
-		const modelSpec = process.env.PI_PERM_GATE_MODEL
-			|| settings.model
-			|| undefined;
-		const blockLevel = (process.env.PI_PERM_GATE_BLOCK_LEVEL as RiskLevel)
-			|| settings.blockLevel
-			|| "low";
-		const timeoutRaw = parseInt(
-			process.env.PI_PERM_GATE_TIMEOUT || String(settings.timeout ?? 10000),
-			10,
-		);
-		const timeout = Number.isNaN(timeoutRaw) ? 10000 : timeoutRaw;
-		const fallback = process.env.PI_PERM_GATE_FALLBACK || "confirm";
-		const maxTokensRaw = parseInt(process.env.PI_PERM_GATE_MAX_TOKENS || String(settings.maxTokens ?? 128), 10);
-		const maxTokens = Number.isNaN(maxTokensRaw) ? 128 : maxTokensRaw;
-		const temperatureRaw = process.env.PI_PERM_GATE_TEMPERATURE
-			? parseFloat(process.env.PI_PERM_GATE_TEMPERATURE)
-			: settings.temperature;
-		const temperature = temperatureRaw !== undefined && !Number.isNaN(temperatureRaw)
-			? temperatureRaw
-			: undefined;
+		const modelSpec = settings.model ?? undefined;
+		const blockLevel = settings.blockLevel ?? "low";
+		const timeout = settings.timeout ?? 10000;
+		const fallback = settings.fallback ?? "confirm";
+		const maxTokens = settings.maxTokens ?? 4096;
+		const temperature = settings.temperature;
+		const thinkingLevel = settings.thinkingLevel;
 
 		let verdict: Verdict;
 		let rawResponse: string | undefined;
 		try {
-			// Use env var model if specified, otherwise prefer a fast/cheap model,
-			// falling back to the session's current model as last resort
+			// Use the configured classifier model, falling back to the session's
+			// current model as last resort.
 			const model = (await resolveModel(modelSpec, ctx.modelRegistry)) ?? ctx.model;
 			if (!model) {
 				throw new Error("No model available for classification");
@@ -782,6 +795,7 @@ export default function (pi: ExtensionAPI) {
 				{
 					maxTokens,
 					...(temperature !== undefined && { temperature }),
+					...(thinkingLevel !== undefined && { reasoning: thinkingLevel }),
 				},
 			);
 			verdict = result.verdict;

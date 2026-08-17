@@ -41,7 +41,7 @@ CWD is passed to the model so `rm -rf ./build` is `low` but `rm -rf /etc` is `hi
 
 The runtime resolves auth and endpoints, so OAuth-only providers (Claude Pro/Max, ChatGPT Plus, Copilot) and env-scoped provider configs classify correctly, not just API-key providers.
 
-## Configuration (precedence: env var > settings.json > default)
+## Configuration (precedence: settings.json > default)
 
 `~/.pi/agent/settings.json`:
 
@@ -50,23 +50,23 @@ The runtime resolves auth and endpoints, so OAuth-only providers (Claude Pro/Max
   "permissionGate": {
     "model": "anthropic/claude-sonnet-4-5",
     "blockLevel": "low",
-    "maxTokens": 128,
+    "maxTokens": 4096,
     "temperature": 0,
-    "timeout": 10000
+    "timeout": 10000,
+    "thinkingLevel": "low"
   }
 }
 ```
 
-Environment variables override settings.json:
-
-| Variable | Default | Description |
+| Field | Default | Description |
 |---|---|---|
-| `PI_PERM_GATE_MODEL` | session model | Model for classification (`provider/modelId` or bare id) |
-| `PI_PERM_GATE_BLOCK_LEVEL` | `low` | Minimum risk to block: `low` \| `medium` \| `high` |
-| `PI_PERM_GATE_TIMEOUT` | `10000` | LLM call timeout in ms |
-| `PI_PERM_GATE_FALLBACK` | `confirm` | If LLM fails: `allow` \| `block` \| `confirm` |
-| `PI_PERM_GATE_MAX_TOKENS` | `128` | Max tokens for the classification call |
-| `PI_PERM_GATE_TEMPERATURE` | unset | Sampling temperature (e.g. `0` or `0.1`) |
+| `model` | session model | Model for classification (`provider/modelId` or bare id) |
+| `blockLevel` | `low` | Minimum risk to block: `low` \| `medium` \| `high` |
+| `timeout` | `10000` | LLM call timeout in ms |
+| `fallback` | `confirm` | If LLM fails: `allow` \| `block` \| `confirm` |
+| `maxTokens` | `4096` | Max tokens for the classification call |
+| `temperature` | unset | Sampling temperature (e.g. `0` or `0.1`) |
+| `thinkingLevel` | unset | Reasoning effort: `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`. Passed to the classifier as `reasoning`; clamped to the model's supported levels by pi-ai. No-op on models whose `thinkingLevelMap` floors every level (e.g. bitdeerai DeepSeek-V4-Pro). Omit to let the model run its default. |
 
 ### `blockLevel` semantics
 
