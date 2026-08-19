@@ -31,6 +31,7 @@ import extension, {
 	EMPTY_RESPONSE_REASON,
 	decideFallback,
 	decideThreshold,
+	formatEmptyResponseDetail,
 } from "./pi-permission-gate.ts";
 
 // ---------------------------------------------------------------------------
@@ -199,6 +200,47 @@ describe("parseVerdict", () => {
 		// historical log entries and tests rely on.
 		assert.equal(PARSE_FAILURE_REASON, "Could not parse LLM verdict");
 		assert.equal(EMPTY_RESPONSE_REASON, "LLM returned empty response");
+	});
+});
+
+describe("formatEmptyResponseDetail", () => {
+	it("clean stop, no content parts, no reasoning breakdown", () => {
+		const detail = formatEmptyResponseDetail({
+			stopReason: "stop",
+			content: [],
+			usage: { output: 0 },
+		});
+		assert.equal(detail, "finish=stop, parts=none, outputTokens=0");
+	});
+
+	it("budget exhausted mid-reasoning: finish=length with reasoning-only content", () => {
+		const detail = formatEmptyResponseDetail({
+			stopReason: "length",
+			content: [{ type: "thinking" }],
+			usage: { output: 1600, reasoning: 1600 },
+		});
+		assert.equal(detail, "finish=length, parts=thinking, outputTokens=1600 (1600 reasoning)");
+	});
+
+	it("rawStopReason appended only when it differs from stopReason", () => {
+		const base = { content: [], usage: { output: 10 } };
+		assert.match(
+			formatEmptyResponseDetail({ ...base, stopReason: "length", rawStopReason: "max_tokens" }),
+			/^finish=length\/max_tokens, /,
+		);
+		assert.match(
+			formatEmptyResponseDetail({ ...base, stopReason: "stop", rawStopReason: "stop" }),
+			/^finish=stop, /,
+		);
+	});
+
+	it("mixed part layout joins types with +", () => {
+		const detail = formatEmptyResponseDetail({
+			stopReason: "stop",
+			content: [{ type: "thinking" }, { type: "toolCall" }],
+			usage: { output: 5 },
+		});
+		assert.equal(detail, "finish=stop, parts=thinking+toolCall, outputTokens=5");
 	});
 });
 
@@ -447,13 +489,32 @@ describe("config plumbing", () => {
 		assert.match(extensionSource, /return \{ verdict: parseVerdict\(responseText\), rawResponse: responseText \}/);
 	});
 
-	it("logCommandDecision accepts an optional rawResponse param", () => {
-		assert.match(extensionSource, /reason\?: string,\s*\n\s*rawResponse\?: string,\s*\n\): void/);
+	it("classifyCommand surfaces the provider error instead of a bare empty-response", () => {
+		// complete() resolves on provider failure with stopReason "error"/"aborted"
+		// and the provider message in errorMessage — that message must win.
+		assert.match(extensionSource, /response\.stopReason === "error" \|\| response\.stopReason === "aborted"/);
+		assert.match(extensionSource, /response\.errorMessage \|\|/);
+		// Genuine empties still throw, but with finish/usage diagnostics attached.
+		assert.match(extensionSource, /formatEmptyResponseDetail\(response\)/);
+	});
+
+	it("fallback allow/block branches log errDetail as errorDetail", () => {
+		assert.match(
+			extensionSource,
+			/logCommandDecision\(command, "unknown", blockLevel, action\.logDecision, action\.logReason, undefined, errDetail\)/,
+		);
+	});
+
+	it("logCommandDecision accepts optional rawResponse and errorDetail params", () => {
+		assert.match(extensionSource, /reason\?: string,\s*\n\s*rawResponse\?: string,\s*\n\s*errorDetail\?: string,\s*\n\): void/);
 		// rawResponse is attached to the log entry (capped at 2000 chars) ...
 		assert.match(extensionSource, /if \(rawResponse !== undefined\)/);
 		assert.match(extensionSource, /rawResponse\.length > 2000/);
 		assert.match(extensionSource, /\u2026\[truncated\]/);
-	});
+		// ... and errorDetail gets the same attach-and-cap treatment.
+		assert.match(extensionSource, /if \(errorDetail !== undefined\)/);
+		assert.match(extensionSource, /errorDetail\.length > 2000/);
+});
 
 	it("decideThreshold owns the parse-failure log rule (behaviorally tested above)", () => {
 		// The parse-failure log-attachment rule moved from an inline parseFailureRaw
@@ -465,18 +526,18 @@ describe("config plumbing", () => {
 		assert.match(extensionSource, /EMPTY_RESPONSE_REASON/);
 	});
 
-	it("confirmWithUser threads rawResponse to its log calls", () => {
+	it("confirmWithUser threads rawResponse and logErrorDetail to its log calls", () => {
 		assert.match(
 			extensionSource,
 			/async function confirmWithUser\([\s\S]*?opts: ConfirmOptions,\s*\n\s*rawResponse\?: string,\s*\n\)/,
 		);
 		assert.match(
 			extensionSource,
-			/logCommandDecision\(command, opts\.risk, blockLevel, "blocked", opts\.blockedLogReason, rawResponse\)/,
+			/logCommandDecision\(command, opts\.risk, blockLevel, "blocked", opts\.blockedLogReason, rawResponse, opts\.logErrorDetail\)/,
 		);
 		assert.match(
 			extensionSource,
-			/logCommandDecision\(command, opts\.risk, blockLevel, "confirmed", opts\.confirmedLogReason, rawResponse\)/,
+			/logCommandDecision\(command, opts\.risk, blockLevel, "confirmed", opts\.confirmedLogReason, rawResponse, opts\.logErrorDetail\)/,
 		);
 	});
 
@@ -628,6 +689,7 @@ describe("decideFallback", () => {
 		assert.equal(a.opts.blockedLogReason, "Blocked by user (AI check failed)");
 		assert.equal(a.opts.confirmedLogReason, "User confirmed after AI check failed");
 		assert.equal(a.opts.blockReason, "Blocked by user (AI check failed)");
+		assert.equal(a.opts.logErrorDetail, "kaboom: detail");
 	});
 
 	it("confirm + !hasUI → block (headless cannot prompt; safety-favoring block)", () => {

@@ -312,6 +312,29 @@ export function parseVerdict(raw: string): Verdict {
 	return { risk: "medium", reason: PARSE_FAILURE_REASON };
 }
 
+/**
+ * Diagnostics for an empty classifier response: finish reason, content-part
+ * layout, and token accounting, so the failure record shows whether the model
+ * stopped cleanly with nothing to say (finish=stop, parts=none), hit its
+ * budget mid-reasoning (finish=length), or replied with reasoning-only
+ * content (parts=thinking). Structural param keeps it testable without
+ * fabricating a full AssistantMessage.
+ */
+export function formatEmptyResponseDetail(response: {
+	stopReason: string;
+	rawStopReason?: string;
+	content: { type: string }[];
+	usage: { output: number; reasoning?: number };
+}): string {
+	const raw =
+		response.rawStopReason && response.rawStopReason !== response.stopReason
+			? `/${response.rawStopReason}`
+			: "";
+	const parts = response.content.map((c) => c.type).join("+") || "none";
+	const reasoning = response.usage.reasoning != null ? ` (${response.usage.reasoning} reasoning)` : "";
+	return `finish=${response.stopReason}${raw}, parts=${parts}, outputTokens=${response.usage.output}${reasoning}`;
+}
+
 function logCommandDecision(
 	command: string,
 	risk: RiskLevel,
@@ -319,6 +342,7 @@ function logCommandDecision(
 	decision: "allowed" | "blocked" | "confirmed",
 	reason?: string,
 	rawResponse?: string,
+	errorDetail?: string,
 ): void {
 	const timestamp = new Date().toISOString();
 	const entry: Record<string, unknown> = {
@@ -337,6 +361,14 @@ function logCommandDecision(
 		entry.rawResponse = rawResponse.length > 2000
 			? rawResponse.slice(0, 2000) + "…[truncated]"
 			: rawResponse;
+	}
+	// Attach the thrown classifier error on the fallback path (timeout, abort,
+	// provider 5xx, empty/broken response) so failure forensics stay in one
+	// file. Same 2000-char cap as rawResponse.
+	if (errorDetail !== undefined) {
+		entry.errorDetail = errorDetail.length > 2000
+			? errorDetail.slice(0, 2000) + "…[truncated]"
+			: errorDetail;
 	}
 	const logLine = JSON.stringify(entry) + "\n";
 
@@ -506,10 +538,20 @@ async function classifyCommand(
 			signal: timeoutController.signal,
 		});
 
+		// complete() resolves — not rejects — on provider failure: the stream's
+		// error event becomes the final AssistantMessage (stopReason "error",
+		// provider message in errorMessage, empty content). Surface that message
+		// rather than misreporting the failure as an empty response.
+		if (response.stopReason === "error" || response.stopReason === "aborted") {
+			throw new Error(
+				response.errorMessage || `LLM classification failed (stop reason: ${response.stopReason})`,
+			);
+		}
+
 		// Extract text from the assistant response
 		const responseText = contentText(response.content);
 		if (!responseText) {
-			throw new Error("LLM classification returned empty response");
+			throw new Error(`LLM classification returned empty response (${formatEmptyResponseDetail(response)})`);
 		}
 		return { verdict: parseVerdict(responseText), rawResponse: responseText };
 	} catch (err) {
@@ -536,6 +578,9 @@ interface ConfirmOptions {
 	blockedLogReason: string;
 	confirmedLogReason: string;
 	blockReason: string;
+	/** Classifier error detail, attached to the decision log as errorDetail.
+	 * Set on the fallback path; undefined on the threshold path. */
+	logErrorDetail?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +615,8 @@ export type ThresholdAction =
 /**
  * Pure fallback decision. config carries the three knobs that branch the
  * matrix: fallback policy, hasUI, and blockLevel (for the logDecision/logReason
- * fields). errDetail threads through to the confirm-prompt opts only.
+ * fields). errDetail threads through to the confirm-prompt opts and, on
+ * every branch, to the decision log's errorDetail field.
  *
  * Six cells (fallback × hasUI):
  *   allow                       → allow
@@ -625,6 +671,7 @@ export function decideFallback(
 			blockedLogReason: "Blocked by user (AI check failed)",
 			confirmedLogReason: "User confirmed after AI check failed",
 			blockReason: "Blocked by user (AI check failed)",
+			logErrorDetail: errDetail,
 		},
 	};
 }
@@ -716,10 +763,10 @@ async function confirmWithUser(
 			["Yes", "No"],
 		);
 		if (choice !== "Yes") {
-			logCommandDecision(command, opts.risk, blockLevel, "blocked", opts.blockedLogReason, rawResponse);
+			logCommandDecision(command, opts.risk, blockLevel, "blocked", opts.blockedLogReason, rawResponse, opts.logErrorDetail);
 			return { block: true, reason: opts.blockReason };
 		}
-		logCommandDecision(command, opts.risk, blockLevel, "confirmed", opts.confirmedLogReason, rawResponse);
+		logCommandDecision(command, opts.risk, blockLevel, "confirmed", opts.confirmedLogReason, rawResponse, opts.logErrorDetail);
 		return undefined;
 	} finally {
 		try {
@@ -811,11 +858,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			const action = decideFallback(errDetail, { blockLevel, fallback, hasUI: ctx.hasUI });
 			if (action.kind === "allow") {
-				logCommandDecision(command, "unknown", blockLevel, action.logDecision, action.logReason);
+				logCommandDecision(command, "unknown", blockLevel, action.logDecision, action.logReason, undefined, errDetail);
 				return undefined;
 			}
 			if (action.kind === "block") {
-				logCommandDecision(command, "unknown", blockLevel, action.logDecision, action.logReason);
+				logCommandDecision(command, "unknown", blockLevel, action.logDecision, action.logReason, undefined, errDetail);
 				return { block: true, reason: action.blockReason };
 			}
 			return confirmWithUser(pi, ctx, command, signature, blockLevel, action.opts);
