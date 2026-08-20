@@ -29,7 +29,9 @@
  *         "maxTokens": 4096,
  *         "temperature": 0,
  *         "timeout": 10000,
- *         "thinkingLevel": "low"
+ *         "thinkingLevel": "low",
+ *         "maxRetries": 3,
+ *         "maxRetryDelayMs": 5000
  *       }
  *     }
  *
@@ -48,6 +50,10 @@
  *     Passed through pi-ai's clampThinkingLevel; no-op on models whose
  *     thinkingLevelMap floors every level (e.g. bitdeerai DeepSeek-V4-Pro
  *     maps low/medium/high -> "high"). Omit to let the model run its default.
+ *   maxRetries   - Max provider-retry attempts on transient HTTP 429/5xx (default: 3).
+ *     Gate-local (not settings.retry.provider) — the gate is synchronous-per-tool-call.
+ *   maxRetryDelayMs - Ceiling on server-requested Retry-After (default: 5000).
+ *     Throws → fallback if the server requests longer; not a clamp.
  */
 
 import {
@@ -398,6 +404,8 @@ interface PermissionGateConfig {
 	timeout?: number;
 	fallback?: "allow" | "block" | "confirm";
 	thinkingLevel?: ModelThinkingLevel;
+	maxRetries?: number;
+	maxRetryDelayMs?: number;
 }
 
 const FALLBACK_LEVELS = ["allow", "block", "confirm"] as const;
@@ -425,6 +433,8 @@ function readPermissionGateConfig(cwd: string, agentDir: string): PermissionGate
 	if (typeof gate.thinkingLevel === "string") {
 		config.thinkingLevel = gate.thinkingLevel as ModelThinkingLevel;
 	}
+	if (typeof gate.maxRetries === "number") config.maxRetries = gate.maxRetries;
+	if (typeof gate.maxRetryDelayMs === "number") config.maxRetryDelayMs = gate.maxRetryDelayMs;
 	return config;
 }
 
@@ -489,7 +499,7 @@ async function classifyCommand(
 	modelRegistry: ModelRegistry,
 	timeout: number,
 	signal: AbortSignal | undefined,
-	options: { maxTokens?: number; temperature?: number; reasoning?: ModelThinkingLevel },
+	options: { maxTokens?: number; temperature?: number; reasoning?: ModelThinkingLevel; maxRetries?: number; maxRetryDelayMs?: number },
 ): Promise<{ verdict: Verdict; rawResponse: string }> {
 	// Fallback to process CWD if ctx.cwd is missing
 	if (!cwd) {
@@ -532,6 +542,9 @@ async function classifyCommand(
 		// pi-ai's runtime — clampThinkingLevel + the openai-completions
 		// reasoningEffort derivation — accepts "off" and maps it to no
 		// reasoning_effort sent. Cast bridges the narrower TS type.
+		// ...options spreads maxRetries/maxRetryDelayMs (gate-local retry budget)
+		// into complete()'s options; prepareRequest forwards them verbatim to
+		// provider.stream() → retryProviderRequest (Retry-After honoring).
 		const response = await modelRegistry.complete(model, context, {
 			...options,
 			reasoning: options.reasoning as ThinkingLevel | undefined,
@@ -821,6 +834,8 @@ export default function (pi: ExtensionAPI) {
 		const maxTokens = settings.maxTokens ?? 4096;
 		const temperature = settings.temperature;
 		const thinkingLevel = settings.thinkingLevel;
+		const maxRetries = settings.maxRetries ?? 3;
+		const maxRetryDelayMs = settings.maxRetryDelayMs ?? 5000;
 
 		let verdict: Verdict;
 		let rawResponse: string | undefined;
@@ -841,6 +856,8 @@ export default function (pi: ExtensionAPI) {
 				ctx.signal,
 				{
 					maxTokens,
+					maxRetries,
+					maxRetryDelayMs,
 					...(temperature !== undefined && { temperature }),
 					...(thinkingLevel !== undefined && { reasoning: thinkingLevel }),
 				},

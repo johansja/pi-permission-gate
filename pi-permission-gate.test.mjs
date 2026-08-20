@@ -629,6 +629,68 @@ describe("CWD-aware system prompt content", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Retry plumbing — source-shape guards for the gate-local retry budget
+// (ADR 0004). The gate is synchronous-per-tool-call, so it cannot reuse the
+// agent's own settings.retry.provider budget (inflates latency on every
+// command during an incident). Gate-local maxRetries/maxRetryDelayMs flow
+// through complete() → prepareRequest → provider.stream() → retryProviderRequest.
+// ---------------------------------------------------------------------------
+
+describe("retry plumbing (ADR 0004)", () => {
+	it("PermissionGateConfig interface declares maxRetries and maxRetryDelayMs", () => {
+		assert.match(extensionSource, /maxRetries\?:\s*number/);
+		assert.match(extensionSource, /maxRetryDelayMs\?:\s*number/);
+	});
+
+	it("readPermissionGateConfig reads gate.maxRetries and gate.maxRetryDelayMs as numbers", () => {
+		assert.match(extensionSource, /typeof gate\.maxRetries === "number"/);
+		assert.match(extensionSource, /typeof gate\.maxRetryDelayMs === "number"/);
+	});
+
+	it("handler derives gate-local defaults (3 retries / 5000ms), not the agent's retry settings", () => {
+		// Gate-local: does NOT read getProviderRetrySettings (the only API to read
+		// settings.retry.provider). The agent's own chat-turn retry budget is a
+		// different consumer. TypeScript rejects settings.retry.provider on the
+		// PermissionGateConfig type, so the getProviderRetrySettings absence is
+		// the structural guard.
+		assert.match(extensionSource, /settings\.maxRetries \?\? 3/);
+		assert.match(extensionSource, /settings\.maxRetryDelayMs \?\? 5000/);
+		assert.doesNotMatch(extensionSource, /getProviderRetrySettings/);
+	});
+
+	it("classifyCommand options type carries maxRetries and maxRetryDelayMs", () => {
+		assert.match(
+			extensionSource,
+			/maxRetries\?:\s*number;\s*maxRetryDelayMs\?:\s*number[^)]*\): Promise<\{ verdict: Verdict; rawResponse: string \}>/,
+		);
+	});
+
+	it("handler passes maxRetries and maxRetryDelayMs into classifyCommand", () => {
+		assert.match(
+			extensionSource,
+			/maxTokens,\s*maxRetries,\s*maxRetryDelayMs,/s,
+		);
+	});
+
+	it("complete() options spread carries the retry budget (no manual maxRetries:0 override)", () => {
+		// ...options spreads maxRetries/maxRetryDelayMs into complete(). The
+		// provider API (openai-completions.js) overrides the SDK's maxRetries:0
+		// with options?.maxRetries via retryProviderRequest — so the gate's
+		// budget reaches the retry layer.
+		assert.match(extensionSource, /\.\.\.options,\s*reasoning: options\.reasoning/s);
+	});
+
+	it("fallback governs post-exhaustion (no gate-side retryAssistantCall wrap)", () => {
+		// Path A (HTTP-layer retryProviderRequest) only — no message-level
+		// retryAssistantCall wrap. Path B declined: it cannot see Retry-After
+		// headers (loses "retry after x seconds" fidelity) and duplicates the
+		// HTTP layer.
+		assert.doesNotMatch(extensionSource, /retryAssistantCall/);
+		assert.doesNotMatch(extensionSource, /isRetryableAssistantError/);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // Behavioral extension tests
 // ---------------------------------------------------------------------------
 

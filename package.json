@@ -1,6 +1,6 @@
 {
   "name": "@johansja/pi-permission-gate",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "LLM-powered safety gate for pi: classifies bash and MCP tool calls by risk before execution, with CWD-aware judgments.",
   "keywords": [
     "pi-package",

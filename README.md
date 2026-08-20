@@ -53,7 +53,9 @@ The runtime resolves auth and endpoints, so OAuth-only providers (Claude Pro/Max
     "maxTokens": 4096,
     "temperature": 0,
     "timeout": 10000,
-    "thinkingLevel": "low"
+    "thinkingLevel": "low",
+    "maxRetries": 3,
+    "maxRetryDelayMs": 5000
   }
 }
 ```
@@ -67,6 +69,8 @@ The runtime resolves auth and endpoints, so OAuth-only providers (Claude Pro/Max
 | `maxTokens` | `4096` | Max tokens for the classification call |
 | `temperature` | unset | Sampling temperature (e.g. `0` or `0.1`) |
 | `thinkingLevel` | unset | Reasoning effort: `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`. Passed to the classifier as `reasoning`; clamped to the model's supported levels by pi-ai. No-op on models whose `thinkingLevelMap` floors every level (e.g. bitdeerai DeepSeek-V4-Pro). Omit to let the model run its default. |
+| `maxRetries` | `3` | Max provider-retry attempts on transient HTTP 429/5xx. Activates pi-ai's `retryProviderRequest` (honors `Retry-After`, exponential backoff). Gate-local — does **not** read `settings.retry.provider` (the agent's own chat-turn retry budget); the gate is synchronous-per-tool-call and fails fast to `fallback` rather than stalling every command through an incident. See [ADR 0004](docs/adr/0004-retry-bitdeer-429-503.md). |
+| `maxRetryDelayMs` | `5000` | Ceiling on server-requested `Retry-After`. If the server requests a longer delay, `retryProviderRequest` **throws** (→ `fallback`) — it does **not** clamp-and-retry. Bounds the gate's exposure to long server-requested waits (e.g. DeepSeek 503 guidance ≥30s → immediate `fallback`). Exponential backoff (no `Retry-After` header) is capped at 8s by pi-ai, independent of this field. 429 and 503 are treated identically. See [ADR 0004](docs/adr/0004-retry-bitdeer-429-503.md). |
 
 ### `blockLevel` semantics
 
