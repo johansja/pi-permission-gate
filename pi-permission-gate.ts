@@ -583,6 +583,9 @@ async function classifyCommand(
 	}
 }
 
+/** setStatus key shared by the classify and confirm-wait gate pills. */
+const GATE_STATUS_KEY = "pi-permission-gate";
+
 interface ConfirmOptions {
 	risk: ConfirmRisk;
 	notifyBody: string;
@@ -757,8 +760,7 @@ async function confirmWithUser(
 	rawResponse?: string,
 ): Promise<{ block: true; reason: string } | undefined> {
 	const icon = RISK_ICON[opts.risk];
-	const statusKey = "pi-permission-gate";
-	const statusText = `${icon} awaiting input`;
+	const statusText = `🛡 gate: ${icon} awaiting input`;
 	const label = `${icon} ${opts.notifyBody}`;
 	// Open block: TUI footer pill (producer-owned, ctx-bound) + bus event
 	// (consumer fires the ctx-less transports). The open/close pair must stay
@@ -766,11 +768,11 @@ async function confirmWithUser(
 	try {
 		try {
 			const theme = ctx.ui.theme;
-			if (theme?.fg) ctx.ui.setStatus(statusKey, theme.fg("accent", statusText));
+			if (theme?.fg) ctx.ui.setStatus(GATE_STATUS_KEY, theme.fg("accent", statusText));
 		} catch {
 			// pi-web: theme proxy can throw before initTheme — best-effort
 		}
-		pi.events.emit("user-input:blocked", { active: true, label, status: { key: statusKey, text: statusText } });
+		pi.events.emit("user-input:blocked", { active: true, label, status: { key: GATE_STATUS_KEY, text: statusText } });
 		const choice = await ctx.ui.select(
 			`${icon} ${opts.promptTitle}\n\n  ${displaySignature}\n\n${opts.promptBody}\n\nAllow?`,
 			["Yes", "No"],
@@ -783,11 +785,11 @@ async function confirmWithUser(
 		return undefined;
 	} finally {
 		try {
-			ctx.ui.setStatus?.(statusKey, undefined);
+			ctx.ui.setStatus?.(GATE_STATUS_KEY, undefined);
 		} catch {
 			// best-effort
 		}
-		pi.events.emit("user-input:blocked", { active: false, statusKey });
+		pi.events.emit("user-input:blocked", { active: false, statusKey: GATE_STATUS_KEY });
 	}
 }
 
@@ -839,6 +841,20 @@ export default function (pi: ExtensionAPI) {
 
 		let verdict: Verdict;
 		let rawResponse: string | undefined;
+		// Fallback-confirm dispatch is deferred past the classify finally: a
+		// finally runs when `return` is evaluated, not when the returned promise
+		// settles, so a catch-scoped dispatch would clobber the awaiting-input
+		// pill that confirmWithUser just set.
+		let fallbackConfirmOpts: ConfirmOptions | undefined;
+		// Classify-phase gate pill: attribute in-flight time to the gate so a
+		// running tool render unambiguously means real execution. Cleared in
+		// finally on every outcome.
+		try {
+			const theme = ctx.ui.theme;
+			if (theme?.fg) ctx.ui.setStatus(GATE_STATUS_KEY, theme.fg("accent", "🛡 gate: classifying…"));
+		} catch {
+			// pi-web: theme proxy can throw before initTheme — best-effort
+		}
 		try {
 			// Use the configured classifier model, falling back to the session's
 			// current model as last resort.
@@ -882,7 +898,16 @@ export default function (pi: ExtensionAPI) {
 				logCommandDecision(command, "unknown", blockLevel, action.logDecision, action.logReason, undefined, errDetail);
 				return { block: true, reason: action.blockReason };
 			}
-			return confirmWithUser(pi, ctx, command, signature, blockLevel, action.opts);
+			fallbackConfirmOpts = action.opts;
+		} finally {
+			try {
+				ctx.ui.setStatus?.(GATE_STATUS_KEY, undefined);
+			} catch {
+				// best-effort
+			}
+		}
+		if (fallbackConfirmOpts) {
+			return confirmWithUser(pi, ctx, command, signature, blockLevel, fallbackConfirmOpts);
 		}
 
 		// Classifier succeeded — decide on the verdict (pure), then the handler

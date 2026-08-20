@@ -7,8 +7,8 @@
  *   - Pure helpers imported from the extension module via tsx (same TS loader
  *     pi uses at runtime). Covers parseVerdict / riskLevelIndex /
  *     buildDisplaySignature / truncateToChars / stripCodeFences invariants.
- *   - Source-shape assertions for config/env plumbing and the CWD-aware system
- *     prompt.
+ *   - Source-shape assertions for config/env plumbing, the CWD-aware system
+ *     prompt, and the gate activity indicator (status-pill phases).
  *
  * The extension's pi-bundled deps (@earendil-works/pi-coding-agent,
  * @earendil-works/pi-ai) resolve from local node_modules (devDependencies);
@@ -567,6 +567,51 @@ describe("config plumbing", () => {
 
 	it("notify body carries the notifyLabel (tool name)", () => {
 		assert.match(extensionSource, /risk — \$\{notifyLabel\}/);
+	});
+});
+
+describe("gate activity indicator", () => {
+	it("uses one shared setStatus key for both gate pills", () => {
+		assert.match(extensionSource, /const GATE_STATUS_KEY = "pi-permission-gate";/);
+		assert.doesNotMatch(extensionSource, /const statusKey =/);
+	});
+
+	it("sets the classify pill in gate grammar before classifying", () => {
+		assert.match(
+			extensionSource,
+			/ctx\.ui\.setStatus\(GATE_STATUS_KEY, theme\.fg\("accent", "🛡 gate: classifying…"\)\)/,
+		);
+	});
+
+	it("clears the pill in the classify try's finally", () => {
+		assert.match(
+			extensionSource,
+			/\} finally \{\s*try \{\s*ctx\.ui\.setStatus\?\.\(GATE_STATUS_KEY, undefined\)/,
+		);
+	});
+
+	it("rewords the confirm-wait pill into gate grammar, risk icon kept", () => {
+		assert.match(extensionSource, /🛡 gate: \$\{icon\} awaiting input/);
+	});
+
+	it("bus payload carries the same key and wording as the footer pill", () => {
+		assert.match(
+			extensionSource,
+			/status: \{ key: GATE_STATUS_KEY, text: statusText \}/,
+		);
+		assert.match(
+			extensionSource,
+			/active: false, statusKey: GATE_STATUS_KEY/,
+		);
+	});
+
+	it("defers the fallback-confirm dispatch past the classify finally", () => {
+		assert.match(extensionSource, /let fallbackConfirmOpts: ConfirmOptions \| undefined;/);
+		assert.match(extensionSource, /fallbackConfirmOpts = action\.opts;/);
+		assert.match(
+			extensionSource,
+			/if \(fallbackConfirmOpts\) \{\s*return confirmWithUser\(pi, ctx, command, signature, blockLevel, fallbackConfirmOpts\);/,
+		);
 	});
 });
 
