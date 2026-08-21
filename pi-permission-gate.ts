@@ -41,7 +41,8 @@
  *     "low"    = block on any risk (safest, most confirmations)
  *     "medium" = block on medium and high risk
  *     "high"   = only block on high risk (fewest confirmations)
- *   timeout      - Timeout in ms for the LLM call (default: 10000)
+ *   timeout      - Per-attempt timeout in ms (default: 10000). Retried by pi-ai's
+ *     retryProviderRequest alongside 429/5xx (governed by maxRetries/maxRetryDelayMs).
  *   fallback     - What to do if LLM fails: "allow" | "block" | "confirm" (default: "confirm")
  *   maxTokens    - Maximum tokens for the LLM classification call (default: 4096)
  *   temperature  - Sampling temperature for classification, e.g. 0 or 0.1 (optional)
@@ -50,7 +51,7 @@
  *     Passed through pi-ai's clampThinkingLevel; no-op on models whose
  *     thinkingLevelMap floors every level (e.g. bitdeerai DeepSeek-V4-Pro
  *     maps low/medium/high -> "high"). Omit to let the model run its default.
- *   maxRetries   - Max provider-retry attempts on transient HTTP 429/5xx (default: 3).
+ *   maxRetries   - Max provider-retry on transient 429/5xx and timeout (default: 3).
  *     Gate-local (not settings.retry.provider) — the gate is synchronous-per-tool-call.
  *   maxRetryDelayMs - Ceiling on server-requested Retry-After (default: 5000).
  *     Throws → fallback if the server requests longer; not a clamp.
@@ -517,70 +518,38 @@ async function classifyCommand(
 		],
 	};
 
-	// Apply timeout via a combined AbortController
-	let timedOut = false;
-	const timeoutController = new AbortController();
+	// `reasoning` carries a ModelThinkingLevel ("off"|"minimal"|...|"max").
+	// SimpleStreamOptions.reasoning is typed as ThinkingLevel (no "off"), but
+	// pi-ai's runtime — clampThinkingLevel + the openai-completions
+	// reasoningEffort derivation — accepts "off" and maps it to no
+	// reasoning_effort sent. Cast bridges the narrower TS type.
+	// ...options spreads maxRetries/maxRetryDelayMs (gate-local retry budget)
+	// into complete()'s options; timeoutMs maps the user-facing `timeout`
+	// setting to pi-ai's per-attempt SDK timeout. retryProviderRequest owns
+	// both 429/5xx-retry (Retry-After) and timeout-retry (ADR 0005).
+	const response = await modelRegistry.complete(model, context, {
+		...options,
+		reasoning: options.reasoning as ThinkingLevel | undefined,
+		signal,
+		timeoutMs: timeout,
+	});
 
-	const timer = setTimeout(() => {
-		timedOut = true;
-		timeoutController.abort();
-	}, timeout);
-
-	// Forward user's abort signal to the timeout controller
-	const onAbort = () => timeoutController.abort();
-	if (signal) {
-		if (signal.aborted) {
-			timeoutController.abort();
-		} else {
-			signal.addEventListener("abort", onAbort, { once: true });
-		}
+	// complete() resolves — not rejects — on provider failure: the stream's
+	// error event becomes the final AssistantMessage (stopReason "error" or
+	// "aborted", provider message in errorMessage, empty content). Surface that
+	// message rather than misreporting the failure as an empty response.
+	if (response.stopReason === "error" || response.stopReason === "aborted") {
+		throw new Error(
+			response.errorMessage || `LLM classification failed (stop reason: ${response.stopReason})`,
+		);
 	}
 
-	try {
-		// `reasoning` carries a ModelThinkingLevel ("off"|"minimal"|...|"max").
-		// SimpleStreamOptions.reasoning is typed as ThinkingLevel (no "off"), but
-		// pi-ai's runtime — clampThinkingLevel + the openai-completions
-		// reasoningEffort derivation — accepts "off" and maps it to no
-		// reasoning_effort sent. Cast bridges the narrower TS type.
-		// ...options spreads maxRetries/maxRetryDelayMs (gate-local retry budget)
-		// into complete()'s options; prepareRequest forwards them verbatim to
-		// provider.stream() → retryProviderRequest (Retry-After honoring).
-		const response = await modelRegistry.complete(model, context, {
-			...options,
-			reasoning: options.reasoning as ThinkingLevel | undefined,
-			signal: timeoutController.signal,
-		});
-
-		// complete() resolves — not rejects — on provider failure: the stream's
-		// error event becomes the final AssistantMessage (stopReason "error",
-		// provider message in errorMessage, empty content). Surface that message
-		// rather than misreporting the failure as an empty response.
-		if (response.stopReason === "error" || response.stopReason === "aborted") {
-			throw new Error(
-				response.errorMessage || `LLM classification failed (stop reason: ${response.stopReason})`,
-			);
-		}
-
-		// Extract text from the assistant response
-		const responseText = contentText(response.content);
-		if (!responseText) {
-			throw new Error(`LLM classification returned empty response (${formatEmptyResponseDetail(response)})`);
-		}
-		return { verdict: parseVerdict(responseText), rawResponse: responseText };
-	} catch (err) {
-		if (timedOut) {
-			throw new Error("LLM classification timed out");
-		}
-		if (signal?.aborted) {
-			throw new Error("LLM classification aborted");
-		}
-		throw err;
-	} finally {
-		clearTimeout(timer);
-		if (signal) {
-			signal.removeEventListener("abort", onAbort);
-		}
+	// Extract text from the assistant response
+	const responseText = contentText(response.content);
+	if (!responseText) {
+		throw new Error(`LLM classification returned empty response (${formatEmptyResponseDetail(response)})`);
 	}
+	return { verdict: parseVerdict(responseText), rawResponse: responseText };
 }
 
 /** setStatus key shared by the classify and confirm-wait gate pills. */

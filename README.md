@@ -64,12 +64,12 @@ The runtime resolves auth and endpoints, so OAuth-only providers (Claude Pro/Max
 |---|---|---|
 | `model` | session model | Model for classification (`provider/modelId` or bare id) |
 | `blockLevel` | `low` | Minimum risk to block: `low` \| `medium` \| `high` |
-| `timeout` | `10000` | LLM call timeout in ms |
+| `timeout` | `10000` | Per-attempt timeout in ms for the LLM classification call. Retried by pi-ai alongside 429/5xx (governed by `maxRetries`/`maxRetryDelayMs`); not a whole-session envelope. See [ADR 0005](docs/adr/0005-timeout-retry-via-timeoutMs.md). |
 | `fallback` | `confirm` | If LLM fails: `allow` \| `block` \| `confirm` |
 | `maxTokens` | `4096` | Max tokens for the classification call |
 | `temperature` | unset | Sampling temperature (e.g. `0` or `0.1`) |
 | `thinkingLevel` | unset | Reasoning effort: `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`. Passed to the classifier as `reasoning`; clamped to the model's supported levels by pi-ai. No-op on models whose `thinkingLevelMap` floors every level (e.g. bitdeerai DeepSeek-V4-Pro). Omit to let the model run its default. |
-| `maxRetries` | `3` | Max provider-retry attempts on transient HTTP 429/5xx. Activates pi-ai's `retryProviderRequest` (honors `Retry-After`, exponential backoff). Gate-local — does **not** read `settings.retry.provider` (the agent's own chat-turn retry budget); the gate is synchronous-per-tool-call and fails fast to `fallback` rather than stalling every command through an incident. See [ADR 0004](docs/adr/0004-retry-bitdeer-429-503.md). |
+| `maxRetries` | `3` | Max provider-retry on transient HTTP 429/5xx **and** timeout. Gate-local — does **not** read `settings.retry.provider` (the agent's chat-turn retry budget); the gate is synchronous-per-tool-call. See [ADR 0004](docs/adr/0004-retry-bitdeer-429-503.md) and [ADR 0005](docs/adr/0005-timeout-retry-via-timeoutMs.md). |
 | `maxRetryDelayMs` | `5000` | Ceiling on server-requested `Retry-After`. If the server requests a longer delay, `retryProviderRequest` **throws** (→ `fallback`) — it does **not** clamp-and-retry. Bounds the gate's exposure to long server-requested waits (e.g. DeepSeek 503 guidance ≥30s → immediate `fallback`). Exponential backoff (no `Retry-After` header) is capped at 8s by pi-ai, independent of this field. 429 and 503 are treated identically. See [ADR 0004](docs/adr/0004-retry-bitdeer-429-503.md). |
 
 ### `blockLevel` semantics

@@ -735,6 +735,40 @@ describe("retry plumbing (ADR 0004)", () => {
 	});
 });
 
+// Timeout-retry redesign (ADR 0005) — source-shape guards.
+
+describe("timeout-retry redesign (ADR 0005)", () => {
+	it("classifyCommand threads timeoutMs into complete()", () => {
+		assert.match(
+			extensionSource,
+			/\.\.\.options,\s*reasoning: options\.reasoning[\s\S]*?signal,\s*timeoutMs: timeout,/s,
+		);
+	});
+
+	it("classifyCommand drops the envelope (no AbortController/setTimeout/timedOut/onAbort/clearTimeout)", () => {
+		// Envelope constructs must not reappear inside classifyCommand.
+		assert.doesNotMatch(extensionSource, /new AbortController\(\)/);
+		assert.doesNotMatch(extensionSource, /let timedOut = false;/);
+		assert.doesNotMatch(extensionSource, /\bonAbort\b/);
+		assert.doesNotMatch(extensionSource, /clearTimeout\(timer\)/);
+		assert.doesNotMatch(extensionSource, /\bsetTimeout\(\(/);
+		assert.doesNotMatch(extensionSource, /timeoutController/);
+		assert.doesNotMatch(extensionSource, /signal\.addEventListener\("abort", onAbort/);
+	});
+
+	it("classifyCommand catch-block no longer rewrites timeout/abort errors", () => {
+		// Thrown errors carry their native message through to errDetail → decideFallback.
+		assert.doesNotMatch(extensionSource, /LLM classification timed out/);
+		assert.doesNotMatch(extensionSource, /LLM classification aborted/);
+	});
+
+	it("timeout field name retained for back-compat (renamed only at the complete() call site)", () => {
+		assert.match(extensionSource, /timeout\?:\s*number;/);
+		assert.match(extensionSource, /typeof gate\.timeout === "number"/);
+		assert.match(extensionSource, /settings\.timeout \?\? 10000/);
+	});
+});
+
 // ---------------------------------------------------------------------------
 // Behavioral extension tests
 // ---------------------------------------------------------------------------
