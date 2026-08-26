@@ -8,6 +8,6 @@ Single-file pi extension. Classifies bash and MCP tool calls via `ctx.modelRegis
 
 - **No build step.** pi loads `.ts` via tsx at runtime. Do not add a compile step.
 - **Self-contained.** No cross-imports; shared patterns are duplicated inline. Intentional — pi extensions are independently deployable.
-- **Tests.** `npm test` runs `node --import tsx --test pi-permission-gate.test.mjs`. Behavioral tests on pure decisions (`decideFallback`, `decideThreshold`); source-shape guards on env-var plumbing and CWD-aware prompt content.
-- **Config.** Env vars `PI_PERM_GATE_*` (env > settings.json `permissionGate` block > defaults).
+- **Tests.** `npm test` runs `node --import tsx --test pi-permission-gate.test.mjs`. Behavioral tests on pure decisions (`decideFallback`, `decideThreshold`); source-shape guards on config plumbing and CWD-aware prompt content.
+- **Config.** settings.json `permissionGate` block (classifier behavior) + pi's `retry.provider` block (retry/timeout budget, ADR 0006) > defaults.
 - **Distribution.** Dual-source: `pi install npm:@johansja/pi-permission-gate` (gallery-listed) and `pi install git:github.com/johansja/pi-permission-gate` (pinned-ref). See `docs/adr/0001`, `docs/adr/0002`.

@@ -450,17 +450,16 @@ describe("config plumbing", () => {
 		assert.match(extensionSource, /settings\.maxTokens \?\? 4096/);
 	});
 
-	it("thinkingLevel setting is read and passed as reasoning", () => {
-		assert.match(extensionSource, /settings\.thinkingLevel/);
-		assert.match(extensionSource, /reasoning: thinkingLevel/);
-	});
-
 	it("fallback setting is validated against allow/block/confirm", () => {
 		assert.match(extensionSource, /FALLBACK_LEVELS/);
 	});
 
-	it("has readPermissionGateConfig function (consolidated single read)", () => {
-		assert.match(extensionSource, /function readPermissionGateConfig/);
+	it("has readRuntimeConfig function (consolidated single read)", () => {
+		assert.match(extensionSource, /function readRuntimeConfig/);
+	});
+
+	it("thinkingLevel setting removed (dead config: complete() → provider.stream drops reasoning silently)", () => {
+		assert.doesNotMatch(extensionSource, /thinkingLevel|ThinkingLevel/);
 	});
 
 	it("classifies via ctx.modelRegistry.complete", () => {
@@ -674,55 +673,52 @@ describe("CWD-aware system prompt content", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Retry plumbing — source-shape guards for the gate-local retry budget
-// (ADR 0004). The gate is synchronous-per-tool-call, so it cannot reuse the
-// agent's own settings.retry.provider budget (inflates latency on every
-// command during an incident). Gate-local maxRetries/maxRetryDelayMs flow
-// through complete() → prepareRequest → provider.stream() → retryProviderRequest.
+// Retry plumbing — source-shape guards for the retry.provider budget
+// (ADR 0006, amends 0004). The gate reads pi's retry.provider block (shared
+// with chat turns) via SettingsManager.getProviderRetrySettings() and forwards
+// it through complete() → prepareRequest → provider.stream() → retryProviderRequest.
+// Legacy gate-local keys (permissionGate.maxRetries/maxRetryDelayMs/timeout)
+// are silently ignored.
 // ---------------------------------------------------------------------------
 
-describe("retry plumbing (ADR 0004)", () => {
-	it("PermissionGateConfig interface declares maxRetries and maxRetryDelayMs", () => {
-		assert.match(extensionSource, /maxRetries\?:\s*number/);
-		assert.match(extensionSource, /maxRetryDelayMs\?:\s*number/);
+describe("retry plumbing (ADR 0006)", () => {
+	it("reads the retry budget from getProviderRetrySettings (shared with chat turns), never agent-level retry.*", () => {
+		assert.match(extensionSource, /getProviderRetrySettings\(\)/);
+		assert.doesNotMatch(extensionSource, /getRetrySettings\(\)|getRetryEnabled\(\)/);
+		assert.doesNotMatch(extensionSource, /settings\.maxRetries \?\? 3/);
+		assert.doesNotMatch(extensionSource, /settings\.maxRetryDelayMs \?\? 5000/);
+		assert.doesNotMatch(extensionSource, /settings\.timeout \?\? 10000/);
 	});
 
-	it("readPermissionGateConfig reads gate.maxRetries and gate.maxRetryDelayMs as numbers", () => {
-		assert.match(extensionSource, /typeof gate\.maxRetries === "number"/);
-		assert.match(extensionSource, /typeof gate\.maxRetryDelayMs === "number"/);
+	it("PermissionGateConfig no longer declares gate-local retry keys", () => {
+		const m = extensionSource.match(/interface PermissionGateConfig \{([^}]*)\}/);
+		assert.ok(m, "PermissionGateConfig interface exists");
+		assert.doesNotMatch(m[1], /maxRetries|maxRetryDelayMs|timeout/);
 	});
 
-	it("handler derives gate-local defaults (3 retries / 5000ms), not the agent's retry settings", () => {
-		// Gate-local: does NOT read getProviderRetrySettings (the only API to read
-		// settings.retry.provider). The agent's own chat-turn retry budget is a
-		// different consumer. TypeScript rejects settings.retry.provider on the
-		// PermissionGateConfig type, so the getProviderRetrySettings absence is
-		// the structural guard.
-		assert.match(extensionSource, /settings\.maxRetries \?\? 3/);
-		assert.match(extensionSource, /settings\.maxRetryDelayMs \?\? 5000/);
-		assert.doesNotMatch(extensionSource, /getProviderRetrySettings/);
-	});
-
-	it("classifyCommand options type carries maxRetries and maxRetryDelayMs", () => {
+	it("classifyCommand options type carries timeoutMs, maxRetries and maxRetryDelayMs", () => {
 		assert.match(
 			extensionSource,
-			/maxRetries\?:\s*number;\s*maxRetryDelayMs\?:\s*number[^)]*\): Promise<\{ verdict: Verdict; rawResponse: string \}>/,
+			/timeoutMs\?:\s*number;\s*maxRetries\?:\s*number;\s*maxRetryDelayMs\?:\s*number[^)]*\): Promise<\{ verdict: Verdict; rawResponse: string \}>/,
 		);
 	});
 
-	it("handler passes maxRetries and maxRetryDelayMs into classifyCommand", () => {
-		assert.match(
-			extensionSource,
-			/maxTokens,\s*maxRetries,\s*maxRetryDelayMs,/s,
-		);
+	it("handler passes the retry.provider budget into classifyCommand", () => {
+		assert.match(extensionSource, /timeoutMs: providerRetry\.timeoutMs/);
+		assert.match(extensionSource, /maxRetries: providerRetry\.maxRetries/);
+		assert.match(extensionSource, /maxRetryDelayMs: providerRetry\.maxRetryDelayMs/);
 	});
 
-	it("complete() options spread carries the retry budget (no manual maxRetries:0 override)", () => {
-		// ...options spreads maxRetries/maxRetryDelayMs into complete(). The
-		// provider API (openai-completions.js) overrides the SDK's maxRetries:0
-		// with options?.maxRetries via retryProviderRequest — so the gate's
-		// budget reaches the retry layer.
-		assert.match(extensionSource, /\.\.\.options,\s*reasoning: options\.reasoning/s);
+	it("forwards only finite-number retry.provider values (junk cannot stall the gate)", () => {
+		assert.match(extensionSource, /Number\.isFinite/);
+	});
+
+	it("complete() applies caller maxRetries (no manual maxRetries:0 override)", () => {
+		// The provider API (openai-completions.js) overrides the SDK's
+		// maxRetries:0 with options?.maxRetries via retryProviderRequest — the
+		// gate must not re-introduce a literal zero over the configured budget.
+		// (The ...options spread itself is locked by the ADR 0005 suite.)
+		assert.doesNotMatch(extensionSource, /maxRetries: 0/);
 	});
 
 	it("fallback governs post-exhaustion (no gate-side retryAssistantCall wrap)", () => {
@@ -738,11 +734,12 @@ describe("retry plumbing (ADR 0004)", () => {
 // Timeout-retry redesign (ADR 0005) — source-shape guards.
 
 describe("timeout-retry redesign (ADR 0005)", () => {
-	it("classifyCommand threads timeoutMs into complete()", () => {
+	it("classifyCommand threads timeoutMs into complete() via the options spread (ADR 0006 source)", () => {
 		assert.match(
 			extensionSource,
-			/\.\.\.options,\s*reasoning: options\.reasoning[\s\S]*?signal,\s*timeoutMs: timeout,/s,
+			/await modelRegistry\.complete\(model, context, \{\s*\.\.\.options,\s*signal,\s*\}\)/s,
 		);
+		assert.doesNotMatch(extensionSource, /timeoutMs: timeout\b/);
 	});
 
 	it("classifyCommand drops the envelope (no AbortController/setTimeout/timedOut/onAbort/clearTimeout)", () => {
@@ -762,11 +759,6 @@ describe("timeout-retry redesign (ADR 0005)", () => {
 		assert.doesNotMatch(extensionSource, /LLM classification aborted/);
 	});
 
-	it("timeout field name retained for back-compat (renamed only at the complete() call site)", () => {
-		assert.match(extensionSource, /timeout\?:\s*number;/);
-		assert.match(extensionSource, /typeof gate\.timeout === "number"/);
-		assert.match(extensionSource, /settings\.timeout \?\? 10000/);
-	});
 });
 
 // ---------------------------------------------------------------------------

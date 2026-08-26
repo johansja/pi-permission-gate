@@ -51,11 +51,7 @@ The runtime resolves auth and endpoints, so OAuth-only providers (Claude Pro/Max
     "model": "anthropic/claude-sonnet-4-5",
     "blockLevel": "low",
     "maxTokens": 4096,
-    "temperature": 0,
-    "timeout": 10000,
-    "thinkingLevel": "low",
-    "maxRetries": 3,
-    "maxRetryDelayMs": 5000
+    "temperature": 0
   }
 }
 ```
@@ -64,13 +60,35 @@ The runtime resolves auth and endpoints, so OAuth-only providers (Claude Pro/Max
 |---|---|---|
 | `model` | session model | Model for classification (`provider/modelId` or bare id) |
 | `blockLevel` | `low` | Minimum risk to block: `low` \| `medium` \| `high` |
-| `timeout` | `10000` | Per-attempt timeout in ms for the LLM classification call. Retried by pi-ai alongside 429/5xx (governed by `maxRetries`/`maxRetryDelayMs`); not a whole-session envelope. See [ADR 0005](docs/adr/0005-timeout-retry-via-timeoutMs.md). |
 | `fallback` | `confirm` | If LLM fails: `allow` \| `block` \| `confirm` |
 | `maxTokens` | `4096` | Max tokens for the classification call |
 | `temperature` | unset | Sampling temperature (e.g. `0` or `0.1`) |
-| `thinkingLevel` | unset | Reasoning effort: `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`. Passed to the classifier as `reasoning`; clamped to the model's supported levels by pi-ai. No-op on models whose `thinkingLevelMap` floors every level (e.g. bitdeerai DeepSeek-V4-Pro). Omit to let the model run its default. |
-| `maxRetries` | `3` | Max provider-retry on transient HTTP 429/5xx **and** timeout. Gate-local — does **not** read `settings.retry.provider` (the agent's chat-turn retry budget); the gate is synchronous-per-tool-call. See [ADR 0004](docs/adr/0004-retry-bitdeer-429-503.md) and [ADR 0005](docs/adr/0005-timeout-retry-via-timeoutMs.md). |
-| `maxRetryDelayMs` | `5000` | Ceiling on server-requested `Retry-After`. If the server requests a longer delay, `retryProviderRequest` **throws** (→ `fallback`) — it does **not** clamp-and-retry. Bounds the gate's exposure to long server-requested waits (e.g. DeepSeek 503 guidance ≥30s → immediate `fallback`). Exponential backoff (no `Retry-After` header) is capped at 8s by pi-ai, independent of this field. 429 and 503 are treated identically. See [ADR 0004](docs/adr/0004-retry-bitdeer-429-503.md). |
+
+### Retry and timeout (`retry.provider`)
+
+The gate's retry/timeout budget comes from pi's own `retry.provider` block — the same config that governs chat turns — read once per tool call and forwarded into `complete()`. See [ADR 0006](docs/adr/0006-retry-config-from-retry-provider.md) (amends [0004](docs/adr/0004-retry-bitdeer-429-503.md)/[0005](docs/adr/0005-timeout-retry-via-timeoutMs.md)).
+
+```json
+{
+  "retry": {
+    "provider": {
+      "maxRetries": 5
+    }
+  }
+}
+```
+
+| `retry.provider` field | Default | Description |
+|---|---|---|
+| `maxRetries` | `0` | Retries on transient HTTP 429/5xx **and** per-attempt timeout. Note the default: with no `retry.provider` block the gate makes a single attempt, then `fallback` applies. |
+| `maxRetryDelayMs` | `60000` | Ceiling on server-requested `Retry-After`. If the server requests a longer delay, `retryProviderRequest` **throws** (→ `fallback`) — it does **not** clamp-and-retry. Exponential backoff (no `Retry-After` header) is hardcoded by pi-ai (`min(0.5·2ⁿ, 8)`s), independent of this field. 429 and 503 are treated identically. |
+| `timeoutMs` | SDK default | Per-attempt timeout in ms. Timeout is retried alongside 429/5xx; not a whole-session envelope. See [ADR 0005](docs/adr/0005-timeout-retry-via-timeoutMs.md). |
+
+The budget is shared with chat turns — tuning it for one tunes both. Note the gate consumes it synchronously per tool call: a large `maxRetries × timeoutMs` product delays every command during a provider incident before `fallback` fires.
+
+Agent-level `retry.*` (`enabled`/`maxRetries`/`baseDelayMs`) does **not** apply to the gate: it wraps whole chat turns in pi's agent loop, which extension `complete()` calls never enter.
+
+**Migrating from <0.7.0:** `permissionGate.maxRetries`, `permissionGate.maxRetryDelayMs`, and `permissionGate.timeout` were removed and are silently ignored (previously defaulted to 3, 5000, and 10000). `permissionGate.thinkingLevel` was also removed — it never reached the model (`ctx.modelRegistry.complete()` routes to the provider's `stream`, which drops `reasoning`; the clamping `streamSimple` path is not exposed to extensions), and the classifier always runs the model's intrinsic reasoning. Move `maxRetries` to `retry.provider.maxRetries` — set it explicitly if you want any retries, since the pi default is `0` — and `maxRetryDelayMs`/`timeoutMs` likewise if you don't want the pi/SDK defaults.
 
 ### `blockLevel` semantics
 

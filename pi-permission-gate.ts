@@ -27,11 +27,7 @@
  *         "model": "anthropic/claude-sonnet-4-5",
  *         "blockLevel": "low",
  *         "maxTokens": 4096,
- *         "temperature": 0,
- *         "timeout": 10000,
- *         "thinkingLevel": "low",
- *         "maxRetries": 3,
- *         "maxRetryDelayMs": 5000
+ *         "temperature": 0
  *       }
  *     }
  *
@@ -41,20 +37,20 @@
  *     "low"    = block on any risk (safest, most confirmations)
  *     "medium" = block on medium and high risk
  *     "high"   = only block on high risk (fewest confirmations)
- *   timeout      - Per-attempt timeout in ms (default: 10000). Retried by pi-ai's
- *     retryProviderRequest alongside 429/5xx (governed by maxRetries/maxRetryDelayMs).
  *   fallback     - What to do if LLM fails: "allow" | "block" | "confirm" (default: "confirm")
  *   maxTokens    - Maximum tokens for the LLM classification call (default: 4096)
  *   temperature  - Sampling temperature for classification, e.g. 0 or 0.1 (optional)
- *   thinkingLevel - Reasoning effort passed to the classifier as `reasoning`:
- *     "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" (optional).
- *     Passed through pi-ai's clampThinkingLevel; no-op on models whose
- *     thinkingLevelMap floors every level (e.g. bitdeerai DeepSeek-V4-Pro
- *     maps low/medium/high -> "high"). Omit to let the model run its default.
- *   maxRetries   - Max provider-retry on transient 429/5xx and timeout (default: 3).
- *     Gate-local (not settings.retry.provider) — the gate is synchronous-per-tool-call.
- *   maxRetryDelayMs - Ceiling on server-requested Retry-After (default: 5000).
- *     Throws → fallback if the server requests longer; not a clamp.
+ *
+ *   Retry/timeout budget comes from pi's own retry.provider block (shared
+ *   with chat turns), read via SettingsManager.getProviderRetrySettings()
+ *   and forwarded into complete() (ADR 0006):
+ *     retry.provider.maxRetries      - transient 429/5xx and timeout retries (default: 0)
+ *     retry.provider.maxRetryDelayMs - ceiling on server-requested Retry-After (default: 60000);
+ *       throws → fallback if the server requests longer; not a clamp.
+ *     retry.provider.timeoutMs       - per-attempt timeout (default: SDK/provider default).
+ *       retryProviderRequest owns both 429/5xx-retry and timeout-retry (ADR 0005).
+ *   Legacy permissionGate.maxRetries/maxRetryDelayMs/timeout are silently
+ *   ignored (removed in v0.7.0).
  */
 
 import {
@@ -67,8 +63,6 @@ import {
 	type Model,
 	type Api,
 	type Context,
-	type ThinkingLevel,
-	type ModelThinkingLevel,
 	contentText,
 	parseJsonWithRepair,
 } from "@earendil-works/pi-ai";
@@ -391,52 +385,53 @@ function logCommandDecision(
 	}
 }
 
-/**
- * Read the permissionGate block from settings.json in one read (one file
- * read, one JSON parse per tool_call — not five). Returns the typed fields
- * the caller derives config from; env-var precedence is applied by the
- * caller, not here. Empty record if the block is absent.
- */
 interface PermissionGateConfig {
 	model?: string;
 	blockLevel?: RiskLevel;
 	maxTokens?: number;
 	temperature?: number;
-	timeout?: number;
 	fallback?: "allow" | "block" | "confirm";
-	thinkingLevel?: ModelThinkingLevel;
-	maxRetries?: number;
-	maxRetryDelayMs?: number;
 }
 
 const FALLBACK_LEVELS = ["allow", "block", "confirm"] as const;
 
-function readPermissionGateConfig(cwd: string, agentDir: string): PermissionGateConfig {
+/**
+ * Per-tool-call runtime config, harvested in one SettingsManager read (one
+ * file read, one JSON parse): the permissionGate block (classifier
+ * behavior) plus pi's retry.provider block (the gate's retry/timeout
+ * budget, ADR 0006). Legacy retry keys left in the permissionGate block
+ * are silently ignored (removed in v0.7.0).
+ */
+function readRuntimeConfig(cwd: string, agentDir: string) {
 	const settingsManager = SettingsManager.create(cwd, agentDir);
 	// SettingsManager doesn't expose custom keys, so read the raw global settings
 	const globalSettings = settingsManager.getGlobalSettings() as Record<string, unknown>;
-	const gate = globalSettings.permissionGate as Record<string, unknown> | undefined;
-	if (!gate) return {};
-	const config: PermissionGateConfig = {};
-	if (typeof gate.model === "string") config.model = gate.model;
-	if (typeof gate.blockLevel === "string" && RISK_LEVELS.includes(gate.blockLevel as RiskLevel)) {
-		config.blockLevel = gate.blockLevel as RiskLevel;
+	const gateBlock = (globalSettings.permissionGate ?? {}) as Record<string, unknown>;
+	const gate: PermissionGateConfig = {};
+	if (typeof gateBlock.model === "string") gate.model = gateBlock.model;
+	if (typeof gateBlock.blockLevel === "string" && RISK_LEVELS.includes(gateBlock.blockLevel as RiskLevel)) {
+		gate.blockLevel = gateBlock.blockLevel as RiskLevel;
 	}
-	if (typeof gate.maxTokens === "number") config.maxTokens = gate.maxTokens;
-	if (typeof gate.temperature === "number") config.temperature = gate.temperature;
-	if (typeof gate.timeout === "number") config.timeout = gate.timeout;
-	if (typeof gate.fallback === "string" && FALLBACK_LEVELS.includes(gate.fallback as "allow" | "block" | "confirm")) {
-		config.fallback = gate.fallback as "allow" | "block" | "confirm";
+	if (typeof gateBlock.maxTokens === "number") gate.maxTokens = gateBlock.maxTokens;
+	if (typeof gateBlock.temperature === "number") gate.temperature = gateBlock.temperature;
+	if (typeof gateBlock.fallback === "string" && FALLBACK_LEVELS.includes(gateBlock.fallback as "allow" | "block" | "confirm")) {
+		gate.fallback = gateBlock.fallback as "allow" | "block" | "confirm";
 	}
-	// thinkingLevel is not validated against a static list. pi-ai's
-	// clampThinkingLevel(model, level) clamps to the model's supported levels
-	// at the provider layer, so any ModelThinkingLevel string is safe here.
-	if (typeof gate.thinkingLevel === "string") {
-		config.thinkingLevel = gate.thinkingLevel as ModelThinkingLevel;
-	}
-	if (typeof gate.maxRetries === "number") config.maxRetries = gate.maxRetries;
-	if (typeof gate.maxRetryDelayMs === "number") config.maxRetryDelayMs = gate.maxRetryDelayMs;
-	return config;
+	// Forward only finite numbers: settings.json is unvalidated, and a
+	// non-numeric maxRetries would NaN retryProviderRequest's attempt
+	// accounting (NaN <= 0 is false — retries never stop), stalling the
+	// synchronous gate indefinitely. Junk values fall back to pi/pi-ai defaults.
+	const finiteNumber = (v: number | undefined): number | undefined =>
+		typeof v === "number" && Number.isFinite(v) ? v : undefined;
+	const retry = settingsManager.getProviderRetrySettings();
+	return {
+		gate,
+		providerRetry: {
+			timeoutMs: finiteNumber(retry.timeoutMs),
+			maxRetries: finiteNumber(retry.maxRetries),
+			maxRetryDelayMs: finiteNumber(retry.maxRetryDelayMs),
+		},
+	};
 }
 
 /**
@@ -498,9 +493,8 @@ async function classifyCommand(
 	cwd: string,
 	model: Model<Api>,
 	modelRegistry: ModelRegistry,
-	timeout: number,
 	signal: AbortSignal | undefined,
-	options: { maxTokens?: number; temperature?: number; reasoning?: ModelThinkingLevel; maxRetries?: number; maxRetryDelayMs?: number },
+	options: { maxTokens?: number; temperature?: number; timeoutMs?: number; maxRetries?: number; maxRetryDelayMs?: number },
 ): Promise<{ verdict: Verdict; rawResponse: string }> {
 	// Fallback to process CWD if ctx.cwd is missing
 	if (!cwd) {
@@ -518,20 +512,15 @@ async function classifyCommand(
 		],
 	};
 
-	// `reasoning` carries a ModelThinkingLevel ("off"|"minimal"|...|"max").
-	// SimpleStreamOptions.reasoning is typed as ThinkingLevel (no "off"), but
-	// pi-ai's runtime — clampThinkingLevel + the openai-completions
-	// reasoningEffort derivation — accepts "off" and maps it to no
-	// reasoning_effort sent. Cast bridges the narrower TS type.
-	// ...options spreads maxRetries/maxRetryDelayMs (gate-local retry budget)
-	// into complete()'s options; timeoutMs maps the user-facing `timeout`
-	// setting to pi-ai's per-attempt SDK timeout. retryProviderRequest owns
-	// both 429/5xx-retry (Retry-After) and timeout-retry (ADR 0005).
+	// ...options spreads maxTokens/temperature and the retry.provider budget
+	// (timeoutMs/maxRetries/maxRetryDelayMs, ADR 0006) into complete(). Unset
+	// fields spread as undefined, which the provider layer treats as absent
+	// (retryProviderRequest defaults maxRetries to 0; the openai-completions
+	// adapter omits `timeout` when timeoutMs is undefined). retryProviderRequest
+	// owns both 429/5xx-retry (Retry-After) and timeout-retry (ADR 0005).
 	const response = await modelRegistry.complete(model, context, {
 		...options,
-		reasoning: options.reasoning as ThinkingLevel | undefined,
 		signal,
-		timeoutMs: timeout,
 	});
 
 	// complete() resolves — not rejects — on provider failure: the stream's
@@ -796,17 +785,15 @@ export default function (pi: ExtensionAPI) {
 					: "mcp")
 				: event.toolName;
 
-		// Load settings: settings.json > default. Read once; derive each field.
-		const settings = readPermissionGateConfig(ctx.cwd, `${process.env.HOME}/.pi/agent`);
-		const modelSpec = settings.model ?? undefined;
+		// Load settings: settings.json > default. One read for the gate block
+		// (classifier behavior) plus pi's retry.provider block (retry/timeout
+		// budget, shared with chat turns — ADR 0006).
+		const { gate: settings, providerRetry } = readRuntimeConfig(ctx.cwd, `${process.env.HOME}/.pi/agent`);
+		const modelSpec = settings.model;
 		const blockLevel = settings.blockLevel ?? "low";
-		const timeout = settings.timeout ?? 10000;
 		const fallback = settings.fallback ?? "confirm";
 		const maxTokens = settings.maxTokens ?? 4096;
 		const temperature = settings.temperature;
-		const thinkingLevel = settings.thinkingLevel;
-		const maxRetries = settings.maxRetries ?? 3;
-		const maxRetryDelayMs = settings.maxRetryDelayMs ?? 5000;
 
 		let verdict: Verdict;
 		let rawResponse: string | undefined;
@@ -837,14 +824,13 @@ export default function (pi: ExtensionAPI) {
 				ctx.cwd,
 				model,
 				ctx.modelRegistry,
-				timeout,
 				ctx.signal,
 				{
 					maxTokens,
-					maxRetries,
-					maxRetryDelayMs,
+					timeoutMs: providerRetry.timeoutMs,
+					maxRetries: providerRetry.maxRetries,
+					maxRetryDelayMs: providerRetry.maxRetryDelayMs,
 					...(temperature !== undefined && { temperature }),
-					...(thinkingLevel !== undefined && { reasoning: thinkingLevel }),
 				},
 			);
 			verdict = result.verdict;
