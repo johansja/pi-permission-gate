@@ -4,7 +4,7 @@
 
 ### gate reasoning scope
 
-`ctx.modelRegistry.complete()` calls made by extensions (this gate's classifier included) do **not** inherit the session's `defaultThinkingLevel` from `settings.json` — that field routes the agent-harness turn loop only. The classifier also sets no `reasoning` of its own: `complete()` routes to the provider's `stream`, which never reads `options.reasoning` (only `streamSimple` maps reasoning → `reasoningEffort` via `clampThinkingLevel`, and the extension-facing `ModelRegistry` does not expose it). The classifier therefore always runs the model's intrinsic reasoning behavior, bounded by `permissionGate.maxTokens`. Contrast: interactive chat turns DO honor `defaultThinkingLevel` (their streamFn is `streamSimple`).
+`ctx.modelRegistry.complete()` calls made by extensions (this gate's classifier included) do **not** inherit the session's `defaultThinkingLevel` from `settings.json` — that field routes the agent-harness turn loop only. The classifier also sets no `reasoning` of its own: `complete()` routes to the provider's `stream`, which never reads `options.reasoning` (only `streamSimple` maps reasoning → `reasoningEffort` via `clampThinkingLevel`, and the extension-facing `ModelRegistry` does not expose it). The classifier therefore always runs the model's intrinsic reasoning behavior, bounded by `permissionGate.maxTokens`. Contrast: interactive chat turns DO honor `defaultThinkingLevel` (their streamFn is `streamSimple`). The `reasoning` drop is option-specific, not a general `complete()` filter: `temperature` is read by every adapter's plain `stream` path (openai-completions `buildParams` sets `params.temperature` when defined; `prepareRequest` forwards option keys), so `permissionGate.temperature` reaches the wire on `complete()` calls.
 
 ### pi permission-gate approaches
 
@@ -27,6 +27,10 @@ The gate's retry/timeout knobs (`timeoutMs`, `maxRetries`, `maxRetryDelayMs`) co
 ### gate activity indicator
 
 Footer status pill (single `setStatus` key `pi-permission-gate`) attributing in-flight time to the gate vs the tool, so a running tool render unambiguously means real execution. Grammar `🛡 gate: <phase>`. Two gate-owned phases marked: **classifying** (`🛡 gate: classifying…`) — set before classification in the tool_call handler, cleared in the classify try's `finally` on every outcome; both confirm dispatches live after that finally (a finally runs at `return` evaluation, not promise settlement — a catch-scoped dispatch would clobber the awaiting-input pill). **Confirm-wait** (`🛡 gate: {risk icon} awaiting input`; ⚪ on the fallback unknown-risk prompt). The `user-input:blocked` status payload carries the same string as the footer pill — one grammar across footer and transports. No elapsed-seconds ticker: the classify window is bounded by the `retry.provider` budget (`maxRetries × timeoutMs`), and seconds add no actionable signal over the static pill. Visual-only: no `pi.events` bus event parallels `user-input:blocked` for the classify phase; no settings opt-out.
+
+### gate classifier model contract
+
+The classifier model must follow the system prompt's exact-JSON instruction. The tolerant parser (code-fence stripping, balanced-brace extraction) rescues wrapped or prose-embedded JSON but cannot recover absent JSON — a parse failure defaults the verdict to `medium` risk, and at `blockLevel: medium` that blocks/confirms every command. Model choice is therefore load-bearing: a non-compliant model turns the gate into a universal interruptor. Bitdeerai-pod compliance: DeepSeek-V4-Flash complies (strict ~25-token JSON, 2–5 s per verdict); GLM-5.3-Flash does not — it answers with markdown essays and invented non-JSON formats, unparseable regardless of tolerance, at 12–44 s per call — unsuitable as classifier. Chat-side uses of GLM-5.3-Flash (e.g. autoSessionName, which needs no JSON) are unaffected.
 
 ## Decisions
 
