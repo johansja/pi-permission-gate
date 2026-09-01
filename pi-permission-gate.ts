@@ -27,7 +27,8 @@
  *         "model": "anthropic/claude-sonnet-4-5",
  *         "blockLevel": "low",
  *         "maxTokens": 4096,
- *         "temperature": 0
+ *         "temperature": 0,
+ *         "reasoningEffort": "low"
  *       }
  *     }
  *
@@ -40,6 +41,10 @@
  *   fallback     - What to do if LLM fails: "allow" | "block" | "confirm" (default: "confirm")
  *   maxTokens    - Maximum tokens for the LLM classification call (default: 4096)
  *   temperature  - Sampling temperature for classification, e.g. 0 or 0.1 (optional)
+ *   reasoningEffort - Reasoning effort for the classification call:
+ *     "minimal"|"low"|"medium"|"high"|"xhigh"|"max" (optional; unset = provider
+ *     default). Mapped through the model's thinkingLevelMap — always-thinking
+ *     models like Kimi-K3 default to max server-side, so set "low" for fast gates.
  *
  *   Retry/timeout budget comes from pi's own retry.provider block (shared
  *   with chat turns), read via SettingsManager.getProviderRetrySettings()
@@ -63,6 +68,7 @@ import {
 	type Model,
 	type Api,
 	type Context,
+	type ThinkingLevel,
 	contentText,
 	parseJsonWithRepair,
 } from "@earendil-works/pi-ai";
@@ -390,10 +396,12 @@ interface PermissionGateConfig {
 	blockLevel?: RiskLevel;
 	maxTokens?: number;
 	temperature?: number;
+	reasoningEffort?: ThinkingLevel;
 	fallback?: "allow" | "block" | "confirm";
 }
 
 const FALLBACK_LEVELS = ["allow", "block", "confirm"] as const;
+const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 /**
  * Per-tool-call runtime config, harvested in one SettingsManager read (one
@@ -414,6 +422,12 @@ function readRuntimeConfig(cwd: string, agentDir: string) {
 	}
 	if (typeof gateBlock.maxTokens === "number") gate.maxTokens = gateBlock.maxTokens;
 	if (typeof gateBlock.temperature === "number") gate.temperature = gateBlock.temperature;
+	if (
+		typeof gateBlock.reasoningEffort === "string" &&
+		(THINKING_LEVELS as readonly string[]).includes(gateBlock.reasoningEffort)
+	) {
+		gate.reasoningEffort = gateBlock.reasoningEffort as ThinkingLevel;
+	}
 	if (typeof gateBlock.fallback === "string" && FALLBACK_LEVELS.includes(gateBlock.fallback as "allow" | "block" | "confirm")) {
 		gate.fallback = gateBlock.fallback as "allow" | "block" | "confirm";
 	}
@@ -494,7 +508,7 @@ async function classifyCommand(
 	model: Model<Api>,
 	modelRegistry: ModelRegistry,
 	signal: AbortSignal | undefined,
-	options: { maxTokens?: number; temperature?: number; timeoutMs?: number; maxRetries?: number; maxRetryDelayMs?: number },
+	options: { maxTokens?: number; temperature?: number; reasoningEffort?: ThinkingLevel; timeoutMs?: number; maxRetries?: number; maxRetryDelayMs?: number },
 ): Promise<{ verdict: Verdict; rawResponse: string }> {
 	// Fallback to process CWD if ctx.cwd is missing
 	if (!cwd) {
@@ -512,12 +526,16 @@ async function classifyCommand(
 		],
 	};
 
-	// ...options spreads maxTokens/temperature and the retry.provider budget
-	// (timeoutMs/maxRetries/maxRetryDelayMs, ADR 0006) into complete(). Unset
-	// fields spread as undefined, which the provider layer treats as absent
-	// (retryProviderRequest defaults maxRetries to 0; the openai-completions
-	// adapter omits `timeout` when timeoutMs is undefined). retryProviderRequest
-	// owns both 429/5xx-retry (Retry-After) and timeout-retry (ADR 0005).
+	// ...options spreads maxTokens/temperature/reasoningEffort and the
+	// retry.provider budget (timeoutMs/maxRetries/maxRetryDelayMs, ADR 0006)
+	// into complete(). Unset fields spread as undefined, which the provider
+	// layer treats as absent (retryProviderRequest defaults maxRetries to 0;
+	// the openai-completions adapter omits `timeout` when timeoutMs is
+	// undefined). retryProviderRequest owns both 429/5xx-retry (Retry-After)
+	// and timeout-retry (ADR 0005). reasoningEffort is honored by the
+	// openai-completions adapter (thinkingLevelMap[reasoningEffort] →
+	// reasoning_effort) — unlike the plain `reasoning` key, which that
+	// adapter silently drops.
 	const response = await modelRegistry.complete(model, context, {
 		...options,
 		signal,
@@ -831,6 +849,7 @@ export default function (pi: ExtensionAPI) {
 					maxRetries: providerRetry.maxRetries,
 					maxRetryDelayMs: providerRetry.maxRetryDelayMs,
 					...(temperature !== undefined && { temperature }),
+					...(settings.reasoningEffort !== undefined && { reasoningEffort: settings.reasoningEffort }),
 				},
 			);
 			verdict = result.verdict;

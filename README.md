@@ -63,6 +63,7 @@ The runtime resolves auth and endpoints, so OAuth-only providers (Claude Pro/Max
 | `fallback` | `confirm` | If LLM fails: `allow` \| `block` \| `confirm` |
 | `maxTokens` | `4096` | Max tokens for the classification call |
 | `temperature` | unset | Sampling temperature (e.g. `0` or `0.1`) |
+| `reasoningEffort` | unset | Reasoning effort for the classifier: `minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max`, mapped through the model's thinkingLevelMap. Always-thinking models like Kimi-K3 default to **max** server-side, so set `"low"` for fast gates |
 
 ### Retry and timeout (`retry.provider`)
 

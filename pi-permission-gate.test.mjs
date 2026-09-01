@@ -458,8 +458,9 @@ describe("config plumbing", () => {
 		assert.match(extensionSource, /function readRuntimeConfig/);
 	});
 
-	it("thinkingLevel setting removed (dead config: complete() → provider.stream drops reasoning silently)", () => {
-		assert.doesNotMatch(extensionSource, /thinkingLevel|ThinkingLevel/);
+	it("reasoningEffort setting honored (openai-completions adapter maps thinkingLevelMap[reasoningEffort] → reasoning_effort; the plain `reasoning` key is what that adapter drops)", () => {
+		assert.match(extensionSource, /reasoningEffort/);
+		assert.doesNotMatch(extensionSource, /\breasoning:/);
 	});
 
 	it("classifies via ctx.modelRegistry.complete", () => {
