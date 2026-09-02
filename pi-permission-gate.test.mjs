@@ -561,12 +561,8 @@ describe("config plumbing", () => {
 
 	it("handler passes signature to both confirmWithUser call sites", () => {
 		// fallback-confirm (classifier failed) and success-block both thread signature.
-		const matches = extensionSource.match(/confirmWithUser\(pi, ctx, command, signature, blockLevel/g) ?? [];
+		const matches = extensionSource.match(/confirmWithUser\(ctx, command, signature, blockLevel/g) ?? [];
 		assert.equal(matches.length, 2, "expected signature at both call sites");
-	});
-
-	it("notify body carries the notifyLabel (tool name)", () => {
-		assert.match(extensionSource, /risk — \$\{notifyLabel\}/);
 	});
 });
 
@@ -594,23 +590,12 @@ describe("gate activity indicator", () => {
 		assert.match(extensionSource, /🛡 gate: \$\{icon\} awaiting input/);
 	});
 
-	it("bus payload carries the same key and wording as the footer pill", () => {
-		assert.match(
-			extensionSource,
-			/status: \{ key: GATE_STATUS_KEY, text: statusText \}/,
-		);
-		assert.match(
-			extensionSource,
-			/active: false, statusKey: GATE_STATUS_KEY/,
-		);
-	});
-
 	it("defers the fallback-confirm dispatch past the classify finally", () => {
 		assert.match(extensionSource, /let fallbackConfirmOpts: ConfirmOptions \| undefined;/);
 		assert.match(extensionSource, /fallbackConfirmOpts = action\.opts;/);
 		assert.match(
 			extensionSource,
-			/if \(fallbackConfirmOpts\) \{\s*return confirmWithUser\(pi, ctx, command, signature, blockLevel, fallbackConfirmOpts\);/,
+			/if \(fallbackConfirmOpts\) \{\s*return confirmWithUser\(ctx, command, signature, blockLevel, fallbackConfirmOpts\);/,
 		);
 	});
 });
@@ -817,7 +802,6 @@ describe("decideFallback", () => {
 		const a = decideFallback("kaboom: detail", cfg({ fallback: "confirm", hasUI: true }));
 		assert.equal(a.kind, "confirm");
 		assert.equal(a.opts.risk, "unknown");
-		assert.equal(a.opts.notifyBody, "Permission gate failed: kaboom: detail");
 		assert.equal(a.opts.promptTitle, "AI safety check failed");
 		assert.equal(a.opts.promptBody, "The LLM could not classify this operation: kaboom: detail");
 		assert.equal(a.opts.blockedLogReason, "Blocked by user (AI check failed)");
@@ -856,7 +840,6 @@ describe("decideThreshold", () => {
 	const cfg = (overrides) => ({
 		blockLevel: "low",
 		hasUI: true,
-		notifyLabel: "bash",
 		...overrides,
 	});
 	const ok = { risk: "low", reason: "minor" };
@@ -884,11 +867,10 @@ describe("decideThreshold", () => {
 		);
 	});
 
-	it("block + hasUI=true → confirm with risk-scoped opts and notifyLabel", () => {
-		const a = decideThreshold({ risk: "medium", reason: "moderate" }, cfg({ blockLevel: "low", hasUI: true, notifyLabel: "atlassian_createIssue" }));
+	it("block + hasUI=true → confirm with risk-scoped opts", () => {
+		const a = decideThreshold({ risk: "medium", reason: "moderate" }, cfg({ blockLevel: "low", hasUI: true }));
 		assert.equal(a.kind, "confirm");
 		assert.equal(a.opts.risk, "medium");
-		assert.equal(a.opts.notifyBody, "Permission gate: medium risk — atlassian_createIssue");
 		assert.equal(a.opts.promptTitle, "Potentially dangerous operation (medium risk)");
 		assert.equal(a.opts.promptBody, "moderate");
 		assert.equal(a.opts.blockedLogReason, "Blocked by user");

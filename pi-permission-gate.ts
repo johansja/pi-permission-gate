@@ -564,7 +564,6 @@ const GATE_STATUS_KEY = "pi-permission-gate";
 
 interface ConfirmOptions {
 	risk: ConfirmRisk;
-	notifyBody: string;
 	promptTitle: string;
 	promptBody: string;
 	blockedLogReason: string;
@@ -578,8 +577,8 @@ interface ConfirmOptions {
 // ---------------------------------------------------------------------------
 // Pure decisions (extracted from the tool_call handler so the matrices are
 // behaviorally testable with no ExtensionAPI fake). The handler owns I/O only:
-// classify, log per the action's log fields, prompt via confirmWithUser, and
-// emit the block lifecycle. Each action carries the log-contract strings so
+// classify, log per the action's log fields, and prompt via confirmWithUser.
+// Each action carries the log-contract strings so
 // tests can lock them without mocking logCommandDecision.
 // ---------------------------------------------------------------------------
 
@@ -657,7 +656,6 @@ export function decideFallback(
 		kind: "confirm",
 		opts: {
 			risk: "unknown",
-			notifyBody: `Permission gate failed: ${errDetail}`,
 			promptTitle: "AI safety check failed",
 			promptBody: `The LLM could not classify this operation: ${errDetail}`,
 			blockedLogReason: "Blocked by user (AI check failed)",
@@ -681,9 +679,9 @@ function shouldLogRawResponse(verdict: Verdict): boolean {
  */
 export function decideThreshold(
 	verdict: Verdict,
-	config: { blockLevel: RiskLevel; hasUI: boolean; notifyLabel: string },
+	config: { blockLevel: RiskLevel; hasUI: boolean },
 ): ThresholdAction {
-	const { blockLevel, hasUI, notifyLabel } = config;
+	const { blockLevel, hasUI } = config;
 	const blockThreshold = riskLevelIndex(blockLevel);
 	const commandRisk = riskLevelIndex(verdict.risk);
 	const logRawResponse = shouldLogRawResponse(verdict);
@@ -708,7 +706,6 @@ export function decideThreshold(
 		kind: "confirm",
 		opts: {
 			risk: verdict.risk,
-			notifyBody: `Permission gate: ${verdict.risk} risk — ${notifyLabel}`,
 			promptTitle: `Potentially dangerous operation (${verdict.risk} risk)`,
 			promptBody: verdict.reason,
 			blockedLogReason: "Blocked by user",
@@ -720,14 +717,13 @@ export function decideThreshold(
 }
 
 /**
- * Emit user-input:blocked (open) + set the TUI footer pill, then prompt the
- * user to allow/deny an operation. Wraps ctx.ui.select() in try/finally so the
- * close emit + pill clear always fire (user answer, abort, or error). A
- * co-loaded user-input:blocked consumer fires the ctx-less transports.
+ * Set the TUI footer pill, then prompt the user to allow/deny an operation.
+ * Wraps ctx.ui.select() in try/finally so the pill clear always fires (user
+ * answer, abort, or error). Blocked-notification transports track pi's core
+ * ui_prompt_start/ui_prompt_end, which fire around ctx.ui.select.
  * Returns {block:true} on denial, undefined on allow.
  */
 async function confirmWithUser(
-	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	command: string,
 	displaySignature: string,
@@ -737,10 +733,6 @@ async function confirmWithUser(
 ): Promise<{ block: true; reason: string } | undefined> {
 	const icon = RISK_ICON[opts.risk];
 	const statusText = `🛡 gate: ${icon} awaiting input`;
-	const label = `${icon} ${opts.notifyBody}`;
-	// Open block: TUI footer pill (producer-owned, ctx-bound) + bus event
-	// (consumer fires the ctx-less transports). The open/close pair must stay
-	// balanced in this try/finally.
 	try {
 		try {
 			const theme = ctx.ui.theme;
@@ -748,7 +740,6 @@ async function confirmWithUser(
 		} catch {
 			// pi-web: theme proxy can throw before initTheme — best-effort
 		}
-		pi.events.emit("user-input:blocked", { active: true, label, status: { key: GATE_STATUS_KEY, text: statusText } });
 		const choice = await ctx.ui.select(
 			`${icon} ${opts.promptTitle}\n\n  ${displaySignature}\n\n${opts.promptBody}\n\nAllow?`,
 			["Yes", "No"],
@@ -765,7 +756,6 @@ async function confirmWithUser(
 		} catch {
 			// best-effort
 		}
-		pi.events.emit("user-input:blocked", { active: false, statusKey: GATE_STATUS_KEY });
 	}
 }
 
@@ -796,12 +786,6 @@ export default function (pi: ExtensionAPI) {
 			event.toolName,
 			event.input as Record<string, unknown>,
 		);
-		const notifyLabel =
-			event.toolName === "mcp"
-				? (typeof event.input.tool === "string" && event.input.tool
-					? event.input.tool
-					: "mcp")
-				: event.toolName;
 
 		// Load settings: settings.json > default. One read for the gate block
 		// (classifier behavior) plus pi's retry.provider block (retry/timeout
@@ -881,12 +865,12 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (fallbackConfirmOpts) {
-			return confirmWithUser(pi, ctx, command, signature, blockLevel, fallbackConfirmOpts);
+			return confirmWithUser(ctx, command, signature, blockLevel, fallbackConfirmOpts);
 		}
 
 		// Classifier succeeded — decide on the verdict (pure), then the handler
 		// does the I/O. rawForLog threads rawResponse only on parse failure.
-		const action = decideThreshold(verdict, { blockLevel, hasUI: ctx.hasUI, notifyLabel });
+		const action = decideThreshold(verdict, { blockLevel, hasUI: ctx.hasUI });
 		const rawForLog = action.logRawResponse ? rawResponse : undefined;
 		if (action.kind === "allow") {
 			logCommandDecision(command, action.log.risk, blockLevel, action.log.decision, action.log.reason, rawForLog);
@@ -896,6 +880,6 @@ export default function (pi: ExtensionAPI) {
 			logCommandDecision(command, action.log.risk, blockLevel, action.log.decision, action.log.reason, rawForLog);
 			return { block: true, reason: action.blockReason };
 		}
-		return confirmWithUser(pi, ctx, command, signature, blockLevel, action.opts, rawForLog);
+		return confirmWithUser(ctx, command, signature, blockLevel, action.opts, rawForLog);
 	});
 }
