@@ -5,12 +5,12 @@ Accepted — amends ADR 0004.
 
 ## Context
 
-ADR 0004 made the gate pass `maxRetries`/`maxRetryDelayMs` into `complete()`, activating `retryProviderRequest` for transient HTTP 429/5xx. **Timeouts were not retried.** The extension enforced its own timeout via an `AbortController`+`setTimeout` envelope around `complete()`, and `retryProviderRequest` cannot retry an abort: on `signal.aborted` it throws `AbortError` immediately, and `isProviderError` rejects it (no `status`/`headers`). A 60s hang fired the envelope once → `fallback=confirm`, zero retries. User symptom (Aug 20 sessions): repeated `fallback=confirm` on full-duration hangs against `bitdeerai/deepseek-ai/DeepSeek-V4-Flash`.
+ADR 0004 made the gate pass `maxRetries`/`maxRetryDelayMs` into `complete()`, activating `retryProviderRequest` for transient HTTP 429/5xx. **Timeouts were not retried.** The extension enforced its own timeout via an `AbortController`+`setTimeout` envelope around `complete()`, and `retryProviderRequest` cannot retry an abort: on `signal.aborted` it throws `AbortError` immediately, and `isProviderError` rejects it (no `status`/`headers`). A 60s hang fired the envelope once → `fallback=confirm`, zero retries. Observed symptom: repeated `fallback=confirm` on full-duration hangs against the gateway-hosted classifier model.
 
 Three facts unlock a simpler fix:
 
 1. pi-ai accepts `timeoutMs` (`StreamOptions`, `types.d.ts:88`).
-2. The openai-completions adapter (bitdeerai V4-Flash uses `api:"openai-completions"`) passes it to the SDK as `{ timeout }` (`api/openai-completions.js:136`).
+2. The openai-completions adapter (the deployment's models use `api:"openai-completions"`) passes it to the SDK as `{ timeout }` (`api/openai-completions.js:136`).
 3. The SDK throws `APIConnectionTimeoutError` on `timeout` expiry. `isProviderError` → true (`APIError` sets `status`/`headers` as own properties); `isRetryableProviderError` → `error.status === undefined` → returns **true**.
 
 So ADR 0004's plumbing plus `timeoutMs` makes pi-ai own **both** timeout-retry (exp backoff) and 429/5xx-retry (`Retry-After` honoring + `maxRetryDelayMs` throw-ceiling) — one layer. The extension's envelope is the accidental complexity; `timeoutMs` is the essential mechanism that was there all along.

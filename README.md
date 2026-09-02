@@ -67,7 +67,7 @@ The runtime resolves auth and endpoints, so OAuth-only providers (Claude Pro/Max
 
 ### Retry and timeout (`retry.provider`)
 
-The gate's retry/timeout budget comes from pi's own `retry.provider` block — the same config that governs chat turns — read once per tool call and forwarded into `complete()`. See [ADR 0006](docs/adr/0006-retry-config-from-retry-provider.md) (amends [0004](docs/adr/0004-retry-bitdeer-429-503.md)/[0005](docs/adr/0005-timeout-retry-via-timeoutMs.md)).
+The gate's retry/timeout budget comes from pi's own `retry.provider` block — the same config that governs chat turns — read once per tool call and forwarded into `complete()`. See [ADR 0006](docs/adr/0006-retry-config-from-retry-provider.md) (amends [0004](docs/adr/0004-retry-classifier-429-503.md)/[0005](docs/adr/0005-timeout-retry-via-timeoutMs.md)).
 
 ```json
 {
@@ -112,6 +112,29 @@ Default `confirm` is safety-favoring: headless classifier-failures fail-closed, 
 ## Logging
 
 Decisions are appended to `~/.pi/pi-permission-gate.jsonl` (timestamp, command, risk, blockLevel, decision, reason; raw LLM response attached only on parse failure, capped at 2000 chars).
+
+## Troubleshooting
+
+**Parse-failure storms** (`Could not parse LLM verdict` on most commands): the classifier model must answer with the exact JSON verdict; the log (see Logging below) attaches the raw response on parse failures so you can see what the model actually returned.
+
+Common cause: the gateway, not the model. pi-ai sends reasoning models' system prompts as `role: "developer"` on providers it doesn't recognize, and some OpenAI-compatible gateways only honor prompt contracts as `role: "system"` (observed on DeepSeek/GLM chat templates; Kimi-K3 complies under either role). The model then ignores the JSON instruction and answers with markdown analysis. The fix lives in your model config (`~/.pi/agent/models.json`), not gate-side:
+
+```json
+{
+  "providers": {
+    "your-gateway": {
+      "models": [
+        {
+          "id": "your-model",
+          "compat": { "supportsDeveloperRole": false }
+        }
+      ]
+    }
+  }
+}
+```
+
+Also worth checking: `maxTokens` too small for a reasoning model's thinking budget (empty or truncated verdicts — the log shows `finish=length` details), and transient 429/503s (configure `retry.provider.maxRetries`, see above).
 
 ## Development
 

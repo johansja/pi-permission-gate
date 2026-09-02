@@ -5,7 +5,7 @@ Accepted
 
 ## Context
 
-The classifier model (`bitdeerai/deepseek-ai/DeepSeek-V4-Flash`) returns transient HTTP 429/503 during incidents. DeepSeek documents 429 with a `Retry-After` header and 503 with "≥30s delay" guidance. These arrive at the openai SDK as an `APIError` with `.status` + `.headers` — what pi-ai's `retryProviderRequest` catches and retries with `Retry-After`-honoring backoff.
+The classifier model (DeepSeek-V4-Flash served via an OpenAI-compatible gateway) returns transient HTTP 429/503 during incidents. DeepSeek documents 429 with a `Retry-After` header and 503 with "≥30s delay" guidance. These arrive at the openai SDK as an `APIError` with `.status` + `.headers` — what pi-ai's `retryProviderRequest` catches and retries with `Retry-After`-honoring backoff.
 
 The gate was not retrying these. Root cause is structural: extensions call `ctx.modelRegistry.complete()` → `ModelRuntime` directly, bypassing `Agent.streamFn` (the only site that injects `settings.retry.provider.maxRetries` into the call). `prepareRequest` forwards caller `options` verbatim with no settings injection; the provider API's `retryProviderRequest` defaults `maxRetries` to 0 without a provider-config fallback. So `settings.retry.provider.maxRetries` configures the agent's own chat turns and compaction, **not the gate** — adding it to `settings.json` alone is a no-op for the gate.
 

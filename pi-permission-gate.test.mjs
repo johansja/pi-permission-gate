@@ -401,7 +401,7 @@ describe("buildDisplaySignature", () => {
 			assignee_account_id: "641a5e161273131f2ae21205",
 			cloudId: "3e3d218b-6aaf-41d8-8120-15bbe4bc7793",
 			contentFormat: "markdown",
-			description: "## Intent\n\nCAPI creates BitdeerAIMachine objects…".repeat(10),
+			description: "## Intent\n\nCAPI creates AWSMachine objects…".repeat(10),
 			issueTypeName: "Task",
 			projectKey: "AIC",
 			summary: "B2 nodepool_reconciler: set Cluster topology.workers (cluster_worker-VM)",
