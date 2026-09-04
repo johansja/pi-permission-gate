@@ -32,6 +32,10 @@ import extension, {
 	decideFallback,
 	decideThreshold,
 	formatEmptyResponseDetail,
+	cacheKey,
+	cacheGetVerdict,
+	cachePutVerdict,
+	cacheEvictVerdict,
 } from "./pi-permission-gate.ts";
 
 // ---------------------------------------------------------------------------
@@ -655,6 +659,137 @@ describe("CWD-aware system prompt content", () => {
 
 	it("does NOT include hasSystemEscapePattern", () => {
 		assert.doesNotMatch(extensionSource, /function hasSystemEscapePattern/);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Verdict cache — session-scoped, keyed (cwd, command); stores the
+// classifier's opinion, never a permission. Failure-mode verdicts are never
+// cached; denial evicts.
+// ---------------------------------------------------------------------------
+
+describe("verdict cache", () => {
+	it("cacheKey is unambiguous across cwd/command boundaries", () => {
+		assert.equal(cacheKey("/a", "ls"), cacheKey("/a", "ls"));
+		// JSON pair key: no separator collision between cwd/command boundaries
+		assert.notEqual(cacheKey("/a", "ls"), cacheKey("/ab", "ls"));
+		assert.notEqual(cacheKey("/a", "ls"), cacheKey("/a", "lsb"));
+		assert.notEqual(cacheKey("/a", "ls"), cacheKey("/a/b", "ls"));
+	});
+
+	it("put/get round-trips a parsed verdict and evict removes it", () => {
+		const k = cacheKey("/test-cache", "echo hi");
+		cacheEvictVerdict(k);
+		assert.equal(cacheGetVerdict(k), undefined);
+		assert.equal(cachePutVerdict(k, { risk: "low", reason: "fine" }), true);
+		assert.deepEqual(cacheGetVerdict(k), { risk: "low", reason: "fine" });
+		cacheEvictVerdict(k);
+		assert.equal(cacheGetVerdict(k), undefined);
+	});
+
+	it("never caches parse-failure or empty-response verdicts", () => {
+		const k1 = cacheKey("/test-cache", "cmd-parse-failure");
+		const k2 = cacheKey("/test-cache", "cmd-empty-response");
+		assert.equal(cachePutVerdict(k1, { risk: "medium", reason: PARSE_FAILURE_REASON }), false);
+		assert.equal(cachePutVerdict(k2, { risk: "medium", reason: EMPTY_RESPONSE_REASON }), false);
+		assert.equal(cacheGetVerdict(k1), undefined);
+		assert.equal(cacheGetVerdict(k2), undefined);
+	});
+
+	it("caps memory with FIFO eviction", () => {
+		for (let i = 0; i < 2100; i++) {
+			cachePutVerdict(cacheKey("/cap", `cmd-${i}`), { risk: "low", reason: "ok" });
+		}
+		// Oldest entries of the batch are gone; a recent one survives
+		assert.equal(cacheGetVerdict(cacheKey("/cap", "cmd-0")), undefined);
+		assert.deepEqual(cacheGetVerdict(cacheKey("/cap", "cmd-2099")), { risk: "low", reason: "ok" });
+
+		// Regression: re-putting an existing key at cap must NOT evict another
+		// entry — Map.set keeps the key's original insertion position, so the
+		// FIFO guard only fires for keys that would grow the map.
+		cachePutVerdict(cacheKey("/cap", "cmd-1500"), { risk: "medium", reason: "updated" });
+		assert.deepEqual(
+			cacheGetVerdict(cacheKey("/cap", "cmd-100")),
+			{ risk: "low", reason: "ok" },
+		);
+		assert.deepEqual(
+			cacheGetVerdict(cacheKey("/cap", "cmd-1500")),
+			{ risk: "medium", reason: "updated" },
+		);
+		// A genuinely new key at cap still evicts the oldest
+		cachePutVerdict(cacheKey("/cap", "cmd-new"), { risk: "low", reason: "ok" });
+		assert.equal(cacheGetVerdict(cacheKey("/cap", "cmd-100")), undefined);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Source-shape guards: credential-disclosure taxonomy, verdict-cache plumbing,
+// and MCP input-shape robustness.
+// ---------------------------------------------------------------------------
+
+describe("credential-disclosure taxonomy", () => {
+	it("system prompt has a Credential disclosure section", () => {
+		assert.match(extensionSource, /Credential disclosure:/);
+	});
+
+	it("exposing live secrets to transcript or off-host rates at least medium", () => {
+		assert.match(extensionSource, /expose live secret values[^\n]*at least medium risk/);
+	});
+
+	it("literal secrets in command text count as disclosure", () => {
+		assert.match(extensionSource, /literal secrets embedded in the command text/);
+	});
+
+	it("in-place credential use stays low (use-vs-leak line)", () => {
+		assert.match(extensionSource, /Using credentials in place stays low when the destination is the credential's own service/);
+	});
+
+	it("credential values to unrelated hosts rate at least medium", () => {
+		assert.match(extensionSource, /sending credential values to unrelated or unknown hosts[^\n]*is at least medium/);
+	});
+
+	it("config metadata and public keys stay safe or low", () => {
+		assert.match(extensionSource, /[Rr]eading config metadata[^\n]*stays safe or low/);
+	});
+});
+
+describe("verdict cache plumbing", () => {
+	it("handler checks the cache before classifying", () => {
+		assert.match(extensionSource, /cacheGetVerdict\(cacheK\)/);
+	});
+
+	it("handler keys the cache on ctx.cwd + command", () => {
+		assert.match(extensionSource, /cacheKey\(ctx\.cwd, command\)/);
+	});
+
+	it("handler stores the verdict after a successful classify", () => {
+		assert.match(extensionSource, /cachePutVerdict\(cacheK, verdict\)/);
+	});
+
+	it("cache hit skips the classify phase (no LLM call)", () => {
+		assert.match(extensionSource, /if \(cachedVerdict\) \{[\s\S]*?verdict = cachedVerdict;[\s\S]*?\} else \{[\s\S]*?classifyCommand/);
+	});
+
+	it("user denial evicts the cached verdict", () => {
+		assert.match(extensionSource, /cacheEvictVerdict\(cacheKey\(ctx\.cwd, command\)\)/);
+	});
+
+	it("cache lives at module scope (session/pi-process lifetime)", () => {
+		assert.match(extensionSource, /const verdictCache = new Map<string, Verdict>\(\);/);
+	});
+});
+
+describe("MCP input-shape robustness", () => {
+	it("never stringifies an absent server into the classified command", () => {
+		assert.doesNotMatch(extensionSource, /server="\$\{server\}", tool=/);
+	});
+
+	it("omits the server segment when input.server is absent", () => {
+		assert.match(extensionSource, /if \(server\) parts\.push/);
+	});
+
+	it("falls back to <unknown> when input.tool is absent", () => {
+		assert.match(extensionSource, /tool="\$\{tool \?\? "<unknown>"\}"/);
 	});
 });
 

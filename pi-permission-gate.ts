@@ -128,6 +128,10 @@ Working directory context:
 - Package installs (npm install, pip install) within CWD are low risk
 - Docker/container operations that only affect project containers are medium risk (still affects runtime)
 
+Credential disclosure:
+- Commands that expose live secret values (private keys, tokens, passwords, cloud credentials, .env contents) into the transcript or to a remote host are at least medium risk — including literal secrets embedded in the command text itself (visible the moment the command is displayed), printing them (cat ~/.ssh/id_rsa, cat .env, echo $TOKEN), or transmitting file contents off-host (curl --post-file, wget --post-data)
+- Using credentials in place stays low when the destination is the credential's own service or established infrastructure (kubectl, aws cli); sending credential values to unrelated or unknown hosts (e.g. curl with a secret in a header or body to an unrecognized URL) is at least medium. Reading config metadata (server URLs, key names, public keys, fingerprints) stays safe or low
+
 Important guidelines:
 - Analyze the FULL command including all flags and arguments
 - Consider chained commands (&&, ||, ;) - rate by the most dangerous segment
@@ -317,6 +321,44 @@ export function parseVerdict(raw: string): Verdict {
 	}
 
 	return { risk: "medium", reason: PARSE_FAILURE_REASON };
+}
+
+// ---------------------------------------------------------------------------
+// Verdict cache — session-scoped (pi process lifetime), keyed (cwd, command).
+// Stores the classifier's opinion, never a permission: a cached verdict
+// re-runs the same threshold logic, so caching cannot auto-allow anything a
+// fresh classify wouldn't. Failure-mode verdicts are never cached, and a user
+// denial evicts the entry so the next identical call re-classifies fresh.
+// FIFO cap bounds memory in long-lived processes.
+// ---------------------------------------------------------------------------
+
+const VERDICT_CACHE_MAX = 2000;
+const verdictCache = new Map<string, Verdict>();
+
+/** Unambiguous cache key: a JSON pair avoids separator collisions in commands. */
+export function cacheKey(cwd: string | undefined, command: string): string {
+	return JSON.stringify([cwd || process.cwd(), command]);
+}
+
+export function cacheGetVerdict(key: string): Verdict | undefined {
+	return verdictCache.get(key);
+}
+
+/** Stores the verdict unless it is a failure-mode verdict (never cached). Returns true when stored. */
+export function cachePutVerdict(key: string, verdict: Verdict): boolean {
+	if (verdict.reason === PARSE_FAILURE_REASON || verdict.reason === EMPTY_RESPONSE_REASON) return false;
+	// Map.set on an existing key keeps its original insertion position, so the
+	// FIFO eviction must only fire for keys that would actually grow the map.
+	if (!verdictCache.has(key) && verdictCache.size >= VERDICT_CACHE_MAX) {
+		const oldest = verdictCache.keys().next().value;
+		if (oldest !== undefined) verdictCache.delete(oldest);
+	}
+	verdictCache.set(key, verdict);
+	return true;
+}
+
+export function cacheEvictVerdict(key: string): void {
+	verdictCache.delete(key);
 }
 
 /**
@@ -745,6 +787,9 @@ async function confirmWithUser(
 			["Yes", "No"],
 		);
 		if (choice !== "Yes") {
+			// Denial revokes the cached verdict (if any) so the next identical
+			// call re-classifies fresh — the per-entry cache revoke path.
+			cacheEvictVerdict(cacheKey(ctx.cwd, command));
 			logCommandDecision(command, opts.risk, blockLevel, "blocked", opts.blockedLogReason, rawResponse, opts.logErrorDetail);
 			return { block: true, reason: opts.blockReason };
 		}
@@ -766,8 +811,8 @@ export default function (pi: ExtensionAPI) {
 			command = event.input.command as string;
 			if (!command?.trim()) return undefined;
 		} else if (event.toolName === "mcp") {
-			const server = event.input.server as string;
-			const tool = event.input.tool as string;
+			const server = event.input.server as string | undefined;
+			const tool = event.input.tool as string | undefined;
 			const args = event.input.args as Record<string, unknown> | string | undefined;
 			let argsStr: string;
 			if (typeof args === "string") {
@@ -777,7 +822,14 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				argsStr = "{}";
 			}
-			command = `MCP tool call: server="${server}", tool="${tool}", args=${argsStr}`;
+			const parts: string[] = [];
+			// Some MCP extensions flatten the server into the tool name and omit
+			// input.server; never stringify undefined into the classified command —
+			// omit absent fields (the tool name carries the server identity).
+			if (server) parts.push(`server="${server}"`);
+			parts.push(`tool="${tool ?? "<unknown>"}"`);
+			parts.push(`args=${argsStr}`);
+			command = `MCP tool call: ${parts.join(", ")}`;
 		} else {
 			return undefined;
 		}
@@ -804,64 +856,72 @@ export default function (pi: ExtensionAPI) {
 		// settles, so a catch-scoped dispatch would clobber the awaiting-input
 		// pill that confirmWithUser just set.
 		let fallbackConfirmOpts: ConfirmOptions | undefined;
-		// Classify-phase gate pill: attribute in-flight time to the gate so a
-		// running tool render unambiguously means real execution. Cleared in
-		// finally on every outcome.
-		try {
-			const theme = ctx.ui.theme;
-			if (theme?.fg) ctx.ui.setStatus(GATE_STATUS_KEY, theme.fg("accent", "🛡 gate: classifying…"));
-		} catch {
-			// pi-web: theme proxy can throw before initTheme — best-effort
-		}
-		try {
-			// Use the configured classifier model, falling back to the session's
-			// current model as last resort.
-			const model = (await resolveModel(modelSpec, ctx.modelRegistry)) ?? ctx.model;
-			if (!model) {
-				throw new Error("No model available for classification");
-			}
-
-			const result = await classifyCommand(
-				command,
-				ctx.cwd,
-				model,
-				ctx.modelRegistry,
-				ctx.signal,
-				{
-					maxTokens,
-					timeoutMs: providerRetry.timeoutMs,
-					maxRetries: providerRetry.maxRetries,
-					maxRetryDelayMs: providerRetry.maxRetryDelayMs,
-					...(temperature !== undefined && { temperature }),
-					...(settings.reasoningEffort !== undefined && { reasoningEffort: settings.reasoningEffort }),
-				},
-			);
-			verdict = result.verdict;
-			rawResponse = result.rawResponse;
-		} catch (err) {
-			// LLM call failed — decide the fallback action (pure), then the handler
-			// does the I/O: one log per allow/block branch; confirm delegates to
-			// confirmWithUser (which logs blocked/confirmed itself).
-			const errDetail = err instanceof Error ? err.message : String(err);
-			console.error(`[pi-permission-gate] Classification failed: ${errDetail}`);
-			if (ctx.hasUI) {
-				ctx.ui.notify(`Permission gate error: ${errDetail}`, "error");
-			}
-			const action = decideFallback(errDetail, { blockLevel, fallback, hasUI: ctx.hasUI });
-			if (action.kind === "allow") {
-				logCommandDecision(command, "unknown", blockLevel, action.logDecision, action.logReason, undefined, errDetail);
-				return undefined;
-			}
-			if (action.kind === "block") {
-				logCommandDecision(command, "unknown", blockLevel, action.logDecision, action.logReason, undefined, errDetail);
-				return { block: true, reason: action.blockReason };
-			}
-			fallbackConfirmOpts = action.opts;
-		} finally {
+		const cacheK = cacheKey(ctx.cwd, command);
+		const cachedVerdict = cacheGetVerdict(cacheK);
+		if (cachedVerdict) {
+			verdict = cachedVerdict;
+		} else {
+			// Classify-phase gate pill: attribute in-flight time to the gate so a
+			// running tool render unambiguously means real execution. Cleared in
+			// finally on every outcome. Skipped on cache hits — no classification
+			// is in flight.
 			try {
-				ctx.ui.setStatus?.(GATE_STATUS_KEY, undefined);
+				const theme = ctx.ui.theme;
+				if (theme?.fg) ctx.ui.setStatus(GATE_STATUS_KEY, theme.fg("accent", "🛡 gate: classifying…"));
 			} catch {
-				// best-effort
+				// pi-web: theme proxy can throw before initTheme — best-effort
+			}
+			try {
+				// Use the configured classifier model, falling back to the session's
+				// current model as last resort.
+				const model = (await resolveModel(modelSpec, ctx.modelRegistry)) ?? ctx.model;
+				if (!model) {
+					throw new Error("No model available for classification");
+				}
+
+				const result = await classifyCommand(
+					command,
+					ctx.cwd,
+					model,
+					ctx.modelRegistry,
+					ctx.signal,
+					{
+						maxTokens,
+						timeoutMs: providerRetry.timeoutMs,
+						maxRetries: providerRetry.maxRetries,
+						maxRetryDelayMs: providerRetry.maxRetryDelayMs,
+						...(temperature !== undefined && { temperature }),
+						...(settings.reasoningEffort !== undefined && { reasoningEffort: settings.reasoningEffort }),
+					},
+				);
+				verdict = result.verdict;
+				rawResponse = result.rawResponse;
+				cachePutVerdict(cacheK, verdict);
+			} catch (err) {
+				// LLM call failed — decide the fallback action (pure), then the handler
+				// does the I/O: one log per allow/block branch; confirm delegates to
+				// confirmWithUser (which logs blocked/confirmed itself).
+				const errDetail = err instanceof Error ? err.message : String(err);
+				console.error(`[pi-permission-gate] Classification failed: ${errDetail}`);
+				if (ctx.hasUI) {
+					ctx.ui.notify(`Permission gate error: ${errDetail}`, "error");
+				}
+				const action = decideFallback(errDetail, { blockLevel, fallback, hasUI: ctx.hasUI });
+				if (action.kind === "allow") {
+					logCommandDecision(command, "unknown", blockLevel, action.logDecision, action.logReason, undefined, errDetail);
+					return undefined;
+				}
+				if (action.kind === "block") {
+					logCommandDecision(command, "unknown", blockLevel, action.logDecision, action.logReason, undefined, errDetail);
+					return { block: true, reason: action.blockReason };
+				}
+				fallbackConfirmOpts = action.opts;
+			} finally {
+				try {
+					ctx.ui.setStatus?.(GATE_STATUS_KEY, undefined);
+				} catch {
+					// best-effort
+				}
 			}
 		}
 		if (fallbackConfirmOpts) {

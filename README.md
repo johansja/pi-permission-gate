@@ -32,14 +32,26 @@ Each `tool_call` for `bash` or `mcp` is classified by a fast/cheap model via `ct
 
 - **safe** — auto-allowed (read-only: `ls`, `cat`, `git status`, `git log`, …)
 - **low** — reversible/CWD-scoped (`rm -rf ./build`, `npm install`, `git commit`, `git checkout`, …)
-- **medium** — significant/external (`git push`, `kubectl apply`, `helm install`, `npm publish`, …)
+- **medium** — significant/external (`git push`, `kubectl apply`, `helm install`, `npm publish`, …) or credential disclosure — exposing live secrets into the transcript (`cat ~/.ssh/id_rsa`, `cat .env`, literal tokens in the command text) or shipping file contents off-host (`curl --post-file …`)
 - **high** — destructive/irreversible (`sudo`, `rm -rf /etc`, `DROP TABLE`, `git push --force`, `shutdown`, …)
 
 At or above `blockLevel` → confirm via TUI prompt (or block in headless). Below → allow. `safe` is always allowed even at `blockLevel=safe` (carve-out prevents threshold-0 false blocks).
 
 CWD is passed to the model so `rm -rf ./build` is `low` but `rm -rf /etc` is `high` — no post-hoc heuristics.
 
-The runtime resolves auth and endpoints, so OAuth-only providers (Claude Pro/Max, ChatGPT Plus, Copilot) and env-scoped provider configs classify correctly, not just API-key providers.
+Credential disclosure draws a **use vs leak** line: in-place use at the credential's own service or established infrastructure (`kubectl`, `aws` CLI) and config-metadata reads stay `low` — sending credential values to unrelated hosts, or leaking them into the transcript, gets a checkpoint.
+
+Identical commands in the same pi process reuse the cached verdict (keyed on CWD + command). The cache stores the classifier's opinion, never a permission — threshold logic re-applies per call. Parse-failure and empty-response verdicts are never cached, and denying a confirm evicts the entry so the next identical call re-classifies fresh.
+
+## How this differs from Claude Code's auto mode
+
+Same mechanism (a model classifier reviews actions before execution), different product:
+
+- **Human-in-the-loop by default.** Auto mode *replaces* the human — its classifier allows or blocks autonomously, and you re-enter only after repeated blocks. This gate *triages*: safe/low run silently, medium/high confirm with you.
+- **It adds a checkpoint where none exists.** pi executes everything natively — no permission popups, no sandbox. Claude Code ships modes, allow/deny rules, hooks, and a sandbox; auto mode is one layer among many there. Here, this gate is the layer.
+- **Any classifier model.** `permissionGate.model` accepts any provider — including OAuth-only ones (Claude Pro/Max, ChatGPT Plus, Copilot) and env-scoped configs; the runtime resolves auth and endpoints. Auto mode's classifier is Anthropic-controlled.
+
+**What it deliberately does not do:** it judges the command, not the agent's intent — it does not read the conversation, so it cannot catch prompt-injection-driven actions that are neither destructive, secret-exposing, nor MCP writes. That residual risk is accepted; pi's own security model treats prompt injection as inherent local-agent risk. Also inherent to the design: classifying sends the full command text — including any literal secrets — to the classifier provider, and the decision log stores commands locally.
 
 ## Configuration (precedence: settings.json > default)
 
