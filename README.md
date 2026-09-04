@@ -41,7 +41,7 @@ CWD is passed to the model so `rm -rf ./build` is `low` but `rm -rf /etc` is `hi
 
 Credential disclosure draws a **use vs leak** line: in-place use at the credential's own service or established infrastructure (`kubectl`, `aws` CLI) and config-metadata reads stay `low` — sending credential values to unrelated hosts, or leaking them into the transcript, gets a checkpoint.
 
-Identical commands in the same pi process reuse the cached verdict (keyed on CWD + command). The cache stores the classifier's opinion, never a permission — threshold logic re-applies per call. Parse-failure and empty-response verdicts are never cached, and denying a confirm evicts the entry so the next identical call re-classifies fresh.
+Identical commands in the same pi process reuse the cached verdict (keyed on CWD + command). The cache stores the classifier's opinion, never a permission — threshold logic re-applies per call. Parse-failure and empty-response verdicts are never cached. Denying a confirm keeps the entry: the denied command re-prompts deterministically, instead of paying a fresh classify that could sample below threshold and slip through silently.
 
 ## How this differs from Claude Code's auto mode
 

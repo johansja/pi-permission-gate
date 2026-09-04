@@ -327,8 +327,10 @@ export function parseVerdict(raw: string): Verdict {
 // Verdict cache — session-scoped (pi process lifetime), keyed (cwd, command).
 // Stores the classifier's opinion, never a permission: a cached verdict
 // re-runs the same threshold logic, so caching cannot auto-allow anything a
-// fresh classify wouldn't. Failure-mode verdicts are never cached, and a user
-// denial evicts the entry so the next identical call re-classifies fresh.
+// fresh classify wouldn't. Failure-mode verdicts are never cached. A denial
+// keeps the cached verdict: only >=-threshold verdicts ever reach a prompt, so
+// the denied command re-prompts deterministically — re-classifying would spend
+// a call and could sample below threshold, silently allowing the retry.
 // FIFO cap bounds memory in long-lived processes.
 // ---------------------------------------------------------------------------
 
@@ -355,10 +357,6 @@ export function cachePutVerdict(key: string, verdict: Verdict): boolean {
 	}
 	verdictCache.set(key, verdict);
 	return true;
-}
-
-export function cacheEvictVerdict(key: string): void {
-	verdictCache.delete(key);
 }
 
 /**
@@ -787,9 +785,6 @@ async function confirmWithUser(
 			["Yes", "No"],
 		);
 		if (choice !== "Yes") {
-			// Denial revokes the cached verdict (if any) so the next identical
-			// call re-classifies fresh — the per-entry cache revoke path.
-			cacheEvictVerdict(cacheKey(ctx.cwd, command));
 			logCommandDecision(command, opts.risk, blockLevel, "blocked", opts.blockedLogReason, rawResponse, opts.logErrorDetail);
 			return { block: true, reason: opts.blockReason };
 		}

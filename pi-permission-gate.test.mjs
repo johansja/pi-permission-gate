@@ -35,7 +35,6 @@ import extension, {
 	cacheKey,
 	cacheGetVerdict,
 	cachePutVerdict,
-	cacheEvictVerdict,
 } from "./pi-permission-gate.ts";
 
 // ---------------------------------------------------------------------------
@@ -665,7 +664,7 @@ describe("CWD-aware system prompt content", () => {
 // ---------------------------------------------------------------------------
 // Verdict cache — session-scoped, keyed (cwd, command); stores the
 // classifier's opinion, never a permission. Failure-mode verdicts are never
-// cached; denial evicts.
+// cached; denial keeps the verdict (deterministic re-prompt, no re-sample).
 // ---------------------------------------------------------------------------
 
 describe("verdict cache", () => {
@@ -677,14 +676,11 @@ describe("verdict cache", () => {
 		assert.notEqual(cacheKey("/a", "ls"), cacheKey("/a/b", "ls"));
 	});
 
-	it("put/get round-trips a parsed verdict and evict removes it", () => {
+	it("put/get round-trips a parsed verdict", () => {
 		const k = cacheKey("/test-cache", "echo hi");
-		cacheEvictVerdict(k);
 		assert.equal(cacheGetVerdict(k), undefined);
 		assert.equal(cachePutVerdict(k, { risk: "low", reason: "fine" }), true);
 		assert.deepEqual(cacheGetVerdict(k), { risk: "low", reason: "fine" });
-		cacheEvictVerdict(k);
-		assert.equal(cacheGetVerdict(k), undefined);
 	});
 
 	it("never caches parse-failure or empty-response verdicts", () => {
@@ -770,8 +766,8 @@ describe("verdict cache plumbing", () => {
 		assert.match(extensionSource, /if \(cachedVerdict\) \{[\s\S]*?verdict = cachedVerdict;[\s\S]*?\} else \{[\s\S]*?classifyCommand/);
 	});
 
-	it("user denial evicts the cached verdict", () => {
-		assert.match(extensionSource, /cacheEvictVerdict\(cacheKey\(ctx\.cwd, command\)\)/);
+	it("user denial keeps the cached verdict (no wear-down re-sample)", () => {
+		assert.doesNotMatch(extensionSource, /cacheEvictVerdict/);
 	});
 
 	it("cache lives at module scope (session/pi-process lifetime)", () => {
