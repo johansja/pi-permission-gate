@@ -119,6 +119,13 @@ MCP tool call context:
 - Destructive MCP operations (delete, remove, drop, terminate, purge, uninstall) are high risk
 - Consider the target server: a notification server sending alerts is lower risk than a database server dropping tables
 
+MCP gateway meta-op context:
+- Commands starting "MCP gateway meta-op:" are pi's internal MCP-gateway operations — the input={...} shown is the gateway invocation verbatim; they execute NO MCP server tool
+- Read-only operations over pi's local tool index and the user's session messages: a "search" key (tool-index search), a "server" key alone (listing one server's tools), a "describe" key (one tool's schema), empty input {} (server status), action "ui-messages" — safe
+- connect starts or refreshes a user-configured MCP server (may spawn its configured process) but executes no tool — low
+- auth-start begins a manual OAuth flow the user drives in a browser (nothing stored yet) — low; auth-complete finishes that user-driven flow and writes the token to the local credential store — at least low; rate higher only if its args look anomalous
+- Only commands starting "MCP tool call:" (with a concrete tool name) execute an MCP server tool — apply the MCP tool call rules above to those
+
 Working directory context:
 - You will be given the current working directory (CWD)
 - Commands whose effects are contained within the CWD are less risky than system-wide equivalents
@@ -179,6 +186,57 @@ function formatSmallValue(val: unknown): string | undefined {
 	return undefined;
 }
 
+/** Present-and-non-blank string field, else undefined. Blank/absent keys fall through to the next mode discriminator. */
+function mcpField(input: Record<string, unknown>, key: string): string | undefined {
+	const v = input[key];
+	return typeof v === "string" && v.trim() ? v : undefined;
+}
+
+/** Raw args payload normalized to a record or string; undefined when absent or empty. */
+function mcpArgs(v: unknown): Record<string, unknown> | string | undefined {
+	if (typeof v === "string") return v.trim() ? v : undefined;
+	if (v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 0) {
+		return v as Record<string, unknown>;
+	}
+	return undefined;
+}
+
+/** Stringify the args payload for the classified command; absent/empty payload renders as {}. */
+function formatMcpArgs(args: Record<string, unknown> | string | undefined): string {
+	if (typeof args === "string") return args;
+	if (args) return JSON.stringify(args);
+	return "{}";
+}
+
+/**
+ * Render an `mcp` gateway invocation for the classifier. pi's dispatch
+ * precedence is action > tool (call mode), so only an invocation with a tool
+ * key and no action key executes an MCP server tool — that keeps the legacy
+ * "MCP tool call:" shape. Some MCP extensions flatten the server into the
+ * tool name and omit input.server; the server segment is omitted then (the
+ * tool name carries the server identity).
+ *
+ * Every other invocation is a gateway meta-op and executes no MCP server
+ * tool. It is rendered verbatim: the input keys ARE the mode names
+ * (search/server/describe/connect/status/action), and a live classifier eval
+ * showed the verbatim dump discriminates as well as a faithful mode-name
+ * rendering — including adversarial query text and a dormant tool key on an
+ * action invocation. Interpretation lives solely in the system prompt's
+ * meta-op context.
+ */
+export function renderMcpCommand(input: Record<string, unknown>): string {
+	const tool = mcpField(input, "tool");
+	if (tool && !mcpField(input, "action")) {
+		const parts: string[] = [];
+		const server = mcpField(input, "server");
+		if (server) parts.push(`server="${server}"`);
+		parts.push(`tool="${tool}"`);
+		parts.push(`args=${formatMcpArgs(mcpArgs(input.args))}`);
+		return `MCP tool call: ${parts.join(", ")}`;
+	}
+	return `MCP gateway meta-op: input=${JSON.stringify(input)} (executes NO MCP server tool)`;
+}
+
 /** Parse `args` (object or JSON string) into a record, or undefined. */
 function parseArgsObject(args: unknown): Record<string, unknown> | undefined {
 	if (args && typeof args === "object" && !Array.isArray(args)) {
@@ -215,10 +273,11 @@ export function buildDisplaySignature(
 		return truncateToChars(cmd.replace(/\n/g, " "), 80);
 	}
 	if (toolName === "mcp") {
-		const server =
-			typeof input?.server === "string" && input.server.trim() ? input.server : undefined;
-		const tool =
-			typeof input?.tool === "string" && input.tool.trim() ? input.tool : "mcp";
+		const tool = mcpField(input ?? {}, "tool");
+		// Gateway meta-op (no tool key) — no server/tool identity to show; the
+		// confirm prompt's body names the mode via the classified command.
+		if (!tool) return "mcp";
+		const server = mcpField(input ?? {}, "server");
 		const argsObj = parseArgsObject(input?.args);
 		const prefix = server ? `${server}/${tool}` : tool;
 		if (!argsObj) return prefix;
@@ -806,25 +865,7 @@ export default function (pi: ExtensionAPI) {
 			command = event.input.command as string;
 			if (!command?.trim()) return undefined;
 		} else if (event.toolName === "mcp") {
-			const server = event.input.server as string | undefined;
-			const tool = event.input.tool as string | undefined;
-			const args = event.input.args as Record<string, unknown> | string | undefined;
-			let argsStr: string;
-			if (typeof args === "string") {
-				argsStr = args;
-			} else if (args && Object.keys(args).length > 0) {
-				argsStr = JSON.stringify(args);
-			} else {
-				argsStr = "{}";
-			}
-			const parts: string[] = [];
-			// Some MCP extensions flatten the server into the tool name and omit
-			// input.server; never stringify undefined into the classified command —
-			// omit absent fields (the tool name carries the server identity).
-			if (server) parts.push(`server="${server}"`);
-			parts.push(`tool="${tool ?? "<unknown>"}"`);
-			parts.push(`args=${argsStr}`);
-			command = `MCP tool call: ${parts.join(", ")}`;
+			command = renderMcpCommand((event.input ?? {}) as Record<string, unknown>);
 		} else {
 			return undefined;
 		}

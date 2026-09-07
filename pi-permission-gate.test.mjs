@@ -35,6 +35,7 @@ import extension, {
 	cacheKey,
 	cacheGetVerdict,
 	cachePutVerdict,
+	renderMcpCommand,
 } from "./pi-permission-gate.ts";
 
 // ---------------------------------------------------------------------------
@@ -303,8 +304,11 @@ describe("buildDisplaySignature", () => {
 		assert.equal(buildDisplaySignature("mcp", { server: undefined, tool: "foo" }), "foo");
 	});
 
-	it("mcp: server/tool absent → 'mcp' fallback", () => {
+	it("mcp meta-op: no tool key → bare 'mcp' (no server/tool identity to show)", () => {
 		assert.equal(buildDisplaySignature("mcp", {}), "mcp");
+		assert.equal(buildDisplaySignature("mcp", { server: "atlassian" }), "mcp");
+		assert.equal(buildDisplaySignature("mcp", { search: "create jira issue", server: "atlassian" }), "mcp");
+		assert.equal(buildDisplaySignature("mcp", { action: "auth-complete", server: "atlassian" }), "mcp");
 	});
 
 	// --- mcp args: small values shown ---
@@ -719,6 +723,58 @@ describe("verdict cache", () => {
 });
 
 // ---------------------------------------------------------------------------
+// renderMcpCommand — the classified string for every mcp gateway invocation:
+// legacy call-mode shape only for tool-without-action (pi dispatch precedence);
+// everything else is a verbatim meta-op dump (interpretation lives in the prompt).
+// ---------------------------------------------------------------------------
+
+describe("renderMcpCommand", () => {
+	it("call mode renders the legacy string unchanged (log contract)", () => {
+		assert.equal(
+			renderMcpCommand({ server: "atlassian", tool: "atlassian_getJiraIssue", args: { id: "AIC-1" } }),
+			'MCP tool call: server="atlassian", tool="atlassian_getJiraIssue", args={"id":"AIC-1"}',
+		);
+		assert.equal(
+			renderMcpCommand({ tool: "atlassian_createJiraIssue" }),
+			'MCP tool call: tool="atlassian_createJiraIssue", args={}',
+		);
+		assert.equal(
+			renderMcpCommand({ server: "exa", tool: "web_search", args: '{"q":"x"}' }),
+			'MCP tool call: server="exa", tool="web_search", args={"q":"x"}',
+		);
+	});
+
+	it("every non-call invocation renders as a verbatim meta-op dump", () => {
+		assert.equal(
+			renderMcpCommand({ search: "create jira issue", server: "atlassian" }),
+			'MCP gateway meta-op: input={"search":"create jira issue","server":"atlassian"} (executes NO MCP server tool)',
+		);
+		assert.equal(
+			renderMcpCommand({}),
+			"MCP gateway meta-op: input={} (executes NO MCP server tool)",
+		);
+		assert.equal(
+			renderMcpCommand({ connect: "exa" }),
+			'MCP gateway meta-op: input={"connect":"exa"} (executes NO MCP server tool)',
+		);
+	});
+
+	it("action beats tool (pi dispatch precedence) — a dormant tool key does not fake a call", () => {
+		assert.equal(
+			renderMcpCommand({ action: "auth-start", tool: "atlassian_deleteIssue", server: "atlassian" }),
+			'MCP gateway meta-op: input={"action":"auth-start","tool":"atlassian_deleteIssue","server":"atlassian"} (executes NO MCP server tool)',
+		);
+	});
+
+	it("blank tool value falls through to the meta-op dump", () => {
+		assert.equal(
+			renderMcpCommand({ tool: "  ", server: "atlassian" }),
+			'MCP gateway meta-op: input={"tool":"  ","server":"atlassian"} (executes NO MCP server tool)',
+		);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // Source-shape guards: credential-disclosure taxonomy, verdict-cache plumbing,
 // and MCP input-shape robustness.
 // ---------------------------------------------------------------------------
@@ -776,16 +832,28 @@ describe("verdict cache plumbing", () => {
 });
 
 describe("MCP input-shape robustness", () => {
+	it("handler renders every gateway invocation via renderMcpCommand", () => {
+		assert.match(extensionSource, /export function renderMcpCommand/);
+		assert.match(extensionSource, /command = renderMcpCommand\(\(event\.input \?\? \{\}\) as Record<string, unknown>\)/);
+	});
+
 	it("never stringifies an absent server into the classified command", () => {
 		assert.doesNotMatch(extensionSource, /server="\$\{server\}", tool=/);
 	});
 
-	it("omits the server segment when input.server is absent", () => {
-		assert.match(extensionSource, /if \(server\) parts\.push/);
+	it("call mode requires a tool key and no action key (pi dispatch precedence: action > tool)", () => {
+		assert.match(extensionSource, /action > tool/);
+		assert.match(extensionSource, /tool && !mcpField\(input, "action"\)/);
 	});
 
-	it("falls back to <unknown> when input.tool is absent", () => {
-		assert.match(extensionSource, /tool="\$\{tool \?\? "<unknown>"\}"/);
+	it("meta-ops render as a verbatim input dump — no <unknown> placeholder, no per-mode switch", () => {
+		assert.doesNotMatch(extensionSource, /<unknown>/);
+		assert.match(extensionSource, /MCP gateway meta-op: input=\$\{JSON\.stringify\(input\)\}/);
+	});
+
+	it("system prompt teaches the key-based meta-op taxonomy", () => {
+		assert.match(extensionSource, /MCP gateway meta-op context:/);
+		assert.match(extensionSource, /a "search" key \(tool-index search\)/);
 	});
 });
 
@@ -1056,3 +1124,4 @@ describe("decideThreshold", () => {
 		assert.equal(a.logRawResponse, false);
 	});
 });
+
