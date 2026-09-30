@@ -28,7 +28,7 @@ pi update --extensions
 
 ## How it works
 
-Each `tool_call` for `bash` or `mcp` is classified by a fast/cheap model via `ctx.modelRegistry.complete()`. The model returns `{risk, reason}`. Risk is compared to your `blockLevel` threshold:
+Each `tool_call` for `bash`, for built-in MCP tools (names like `mcp__<server>__<tool>`, called directly or from codemode scripts), or for the legacy gateway `mcp` tool (pi-mcp-adapter installs) is classified by a fast/cheap model via `ctx.modelRegistry.complete()`. The model returns `{risk, reason}`. Risk is compared to your `blockLevel` threshold:
 
 - **safe** — auto-allowed (read-only: `ls`, `cat`, `git status`, `git log`, …)
 - **low** — reversible/CWD-scoped (`rm -rf ./build`, `npm install`, `git commit`, `git checkout`, …)

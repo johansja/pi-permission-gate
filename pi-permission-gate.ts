@@ -3,7 +3,12 @@
  *
  * Uses ctx.modelRegistry.complete() (the coding-agent model runtime) to classify
  * bash commands and MCP tool calls by risk level and require user confirmation
- * before executing potentially harmful ones. The runtime resolves auth (apiKey,
+ * before executing potentially harmful ones. MCP coverage spans pi's built-in
+ * MCP integration (tools registered as `mcp__<server>__<tool>`, called directly
+ * or via codemode nested calls) and the legacy gateway `mcp` tool from MCP
+ * extensions like pi-mcp-adapter.
+ *
+ * The runtime resolves auth (apiKey,
  * headers, env, baseUrl) and credential-resolved endpoints internally, so
  * OAuth-only providers (Claude Pro/Max, ChatGPT Plus, Copilot) and env-scoped
  * provider configs classify correctly, not just API-key providers.
@@ -112,7 +117,7 @@ Risk levels:
 - high: Destructive, irreversible, or security-sensitive operations, including system-wide or irreversible operations, or operations outside CWD that affect system state (rm -rf /etc, sudo, DROP TABLE, TRUNCATE, DELETE without WHERE, UPDATE without WHERE, git push --force, kubectl delete, shutdown, reboot, mkfs, dd, iptables, chmod 777)
 
 MCP tool call context:
-- You may also be asked to analyze MCP (Model Context Protocol) tool calls
+- "MCP tool call:" lines are MCP (Model Context Protocol) tool calls — from pi's built-in MCP support (tool names like mcp__<server>__<tool>) or a legacy MCP gateway extension
 - MCP read/search/list/describe operations (e.g. web_search, web_fetch, search, list, get, describe) are generally safe or low risk
 - MCP write/modify/create/send operations (e.g. create_issue, update, delete, send_notification, publish, apply) are at least medium risk
 - MCP operations affecting production infrastructure or external systems (e.g. deploy, release, provision) are at least medium risk
@@ -237,6 +242,43 @@ export function renderMcpCommand(input: Record<string, unknown>): string {
 	return `MCP gateway meta-op: input=${JSON.stringify(input)} (executes NO MCP server tool)`;
 }
 
+/**
+ * Split `mcp__<server>__<tool>` into server/tool. Configured server names may
+ * only contain letters, digits, `_`, `-`, so the first `__` after the prefix
+ * ends the server and the rest is the tool. A degenerate name (no separator)
+ * yields server=undefined — still gated, never skipped. Undefined for
+ * non-`mcp__` names.
+ */
+export function parseMcpToolName(
+	toolName: string,
+): { server: string | undefined; tool: string } | undefined {
+	if (!toolName.startsWith("mcp__")) return undefined;
+	const rest = toolName.slice("mcp__".length);
+	const sep = rest.indexOf("__");
+	if (sep === -1) return { server: undefined, tool: rest };
+	return { server: rest.slice(0, sep), tool: rest.slice(sep + 2) };
+}
+
+/**
+ * Render a built-in MCP tool call for the classifier — same `MCP tool call:`
+ * prefix as the legacy gateway render so one prompt taxonomy covers both.
+ * Server/tool parse from the `mcp__<server>__<tool>` name; args render
+ * verbatim. Calls arrive directly (direct/deferred exposure) or as codemode
+ * nested calls — both fire tool_call, so one name match covers all exposure
+ * modes.
+ */
+export function renderBuiltinMcpCommand(
+	toolName: string,
+	input: Record<string, unknown>,
+): string {
+	const { server, tool } = parseMcpToolName(toolName) ?? { server: undefined, tool: toolName };
+	const parts: string[] = [];
+	if (server) parts.push(`server="${server}"`);
+	parts.push(`tool="${tool}"`);
+	parts.push(`args=${formatMcpArgs(mcpArgs(input))}`);
+	return `MCP tool call: ${parts.join(", ")}`;
+}
+
 /** Parse `args` (object or JSON string) into a record, or undefined. */
 function parseArgsObject(args: unknown): Record<string, unknown> | undefined {
 	if (args && typeof args === "object" && !Array.isArray(args)) {
@@ -262,8 +304,32 @@ function parseArgsObject(args: unknown): Record<string, unknown> | undefined {
  * arg values. Long free-text values (e.g. a Jira ticket `description` body) and
  * opaque IDs are dropped with a `+N more` count so the user knows the detail
  * lives in pi's render. The classifier LLM still sees the full command — this
- * is display-only.
+ * is display-only. Covers the legacy gateway `mcp` tool and built-in MCP tool
+ * names (`mcp__<server>__<tool>`).
  */
+
+/** Shared `server/tool(small args)` rendering for MCP display signatures. */
+function smallArgsSignature(
+	server: string | undefined,
+	tool: string,
+	argsObj: Record<string, unknown> | undefined,
+): string {
+	const prefix = server ? `${server}/${tool}` : tool;
+	if (!argsObj) return prefix;
+	const keys = Object.keys(argsObj);
+	if (keys.length === 0) return prefix;
+	const parts: string[] = [];
+	let more = 0;
+	for (const k of keys) {
+		const v = formatSmallValue(argsObj[k]);
+		if (v !== undefined) parts.push(`${k}=${v}`);
+		else more++;
+	}
+	const moreSuffix = more > 0 ? `, +${more} more` : "";
+	if (parts.length === 0) return `${prefix}(+${more} more)`;
+	return `${prefix}(${parts.join(", ")}${moreSuffix})`;
+}
+
 export function buildDisplaySignature(
 	toolName: string,
 	input: Record<string, unknown>,
@@ -277,22 +343,16 @@ export function buildDisplaySignature(
 		// Gateway meta-op (no tool key) — no server/tool identity to show; the
 		// confirm prompt's body names the mode via the classified command.
 		if (!tool) return "mcp";
-		const server = mcpField(input ?? {}, "server");
-		const argsObj = parseArgsObject(input?.args);
-		const prefix = server ? `${server}/${tool}` : tool;
-		if (!argsObj) return prefix;
-		const keys = Object.keys(argsObj);
-		if (keys.length === 0) return prefix;
-		const parts: string[] = [];
-		let more = 0;
-		for (const k of keys) {
-			const v = formatSmallValue(argsObj[k]);
-			if (v !== undefined) parts.push(`${k}=${v}`);
-			else more++;
-		}
-		const moreSuffix = more > 0 ? `, +${more} more` : "";
-		if (parts.length === 0) return `${prefix}(+${more} more)`;
-		return `${prefix}(${parts.join(", ")}${moreSuffix})`;
+		return smallArgsSignature(
+			mcpField(input ?? {}, "server"),
+			tool,
+			parseArgsObject(input?.args),
+		);
+	}
+	const parsed = parseMcpToolName(toolName);
+	if (parsed) {
+		// Built-in MCP: server/tool live in the tool name and input IS the args.
+		return smallArgsSignature(parsed.server, parsed.tool || toolName, input);
 	}
 	return toolName;
 }
@@ -866,6 +926,11 @@ export default function (pi: ExtensionAPI) {
 			if (!command?.trim()) return undefined;
 		} else if (event.toolName === "mcp") {
 			command = renderMcpCommand((event.input ?? {}) as Record<string, unknown>);
+		} else if (event.toolName.startsWith("mcp__")) {
+			command = renderBuiltinMcpCommand(
+				event.toolName,
+				(event.input ?? {}) as Record<string, unknown>,
+			);
 		} else {
 			return undefined;
 		}

@@ -36,6 +36,8 @@ import extension, {
 	cacheGetVerdict,
 	cachePutVerdict,
 	renderMcpCommand,
+	parseMcpToolName,
+	renderBuiltinMcpCommand,
 } from "./pi-permission-gate.ts";
 
 // ---------------------------------------------------------------------------
@@ -854,6 +856,84 @@ describe("MCP input-shape robustness", () => {
 	it("system prompt teaches the key-based meta-op taxonomy", () => {
 		assert.match(extensionSource, /MCP gateway meta-op context:/);
 		assert.match(extensionSource, /a "search" key \(tool-index search\)/);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Built-in MCP (pi >= built-in MCP support): tools register as
+// mcp__<server>__<tool>, and codemode scripts issue the same calls as nested
+// tool_calls. A mcp__ prefix match + the same "MCP tool call:" render covers
+// all exposure modes.
+// ---------------------------------------------------------------------------
+
+describe("built-in MCP tool calls", () => {
+	it("parseMcpToolName: first __ after the prefix splits server/tool", () => {
+		assert.deepEqual(parseMcpToolName("mcp__atlassian__create_issue"), {
+			server: "atlassian",
+			tool: "create_issue",
+		});
+		// Server names can't contain __ (validated config); a tool name can —
+		// the remainder after the first separator is the tool, verbatim.
+		assert.deepEqual(parseMcpToolName("mcp__srv__my__tool"), { server: "srv", tool: "my__tool" });
+	});
+
+	it("parseMcpToolName: degenerate names gate with server undefined, non-MCP names don't parse", () => {
+		assert.deepEqual(parseMcpToolName("mcp__solo"), { server: undefined, tool: "solo" });
+		assert.deepEqual(parseMcpToolName("mcp__"), { server: undefined, tool: "" });
+		for (const notMcp of ["read", "mcp", "codemode", "tool_search"]) {
+			assert.equal(parseMcpToolName(notMcp), undefined, notMcp);
+		}
+	});
+
+	it("renderBuiltinMcpCommand: same 'MCP tool call:' shape as the gateway render (one prompt taxonomy)", () => {
+		assert.equal(
+			renderBuiltinMcpCommand("mcp__atlassian__create_issue", { summary: "x" }),
+			'MCP tool call: server="atlassian", tool="create_issue", args={"summary":"x"}',
+		);
+		// Args verbatim (no server/tool stripping) — the verbatim-dump property
+		// the gateway meta-op eval validated.
+		assert.equal(
+			renderBuiltinMcpCommand("mcp__exa__web_fetch", { url: "https://x", b: 1 }),
+			'MCP tool call: server="exa", tool="web_fetch", args={"url":"https://x","b":1}',
+		);
+	});
+
+	it("renderBuiltinMcpCommand: degenerate names omit the server segment", () => {
+		assert.equal(
+			renderBuiltinMcpCommand("mcp__weird", {}),
+			'MCP tool call: tool="weird", args={}',
+		);
+	});
+
+	it("display signature: server/tool prefix with small-args filtering", () => {
+		assert.equal(
+			buildDisplaySignature("mcp__atlassian__create_issue", {
+				summary: "B2 fix",
+				description: "long".repeat(40),
+				id: "641a5e161273131f2ae21205",
+			}),
+			'atlassian/create_issue(summary="B2 fix", +2 more)',
+		);
+		// Array values are dropped like other non-scalars.
+		assert.equal(
+			buildDisplaySignature("mcp__parallel-search__web_search", { queries: ["q1"] }),
+			"parallel-search/web_search(+1 more)",
+		);
+	});
+
+	it("handler dispatches mcp__ tool names through the classifier", () => {
+		assert.match(extensionSource, /else if \(event\.toolName\.startsWith\("mcp__"\)\)/);
+		assert.match(extensionSource, /renderBuiltinMcpCommand\(\s*event\.toolName,/s);
+	});
+
+	it("system prompt documents built-in MCP naming", () => {
+		assert.match(extensionSource, /mcp__<server>__<tool>/);
+	});
+
+	it("codemode and tool_search stay ungated (their effectful surface is nested tool_calls)", () => {
+		assert.match(extensionSource, /event\.toolName\.startsWith\("mcp__"\)/);
+		assert.doesNotMatch(extensionSource, /event\.toolName === "codemode"/);
+		assert.doesNotMatch(extensionSource, /event\.toolName === "tool_search"/);
 	});
 });
 
