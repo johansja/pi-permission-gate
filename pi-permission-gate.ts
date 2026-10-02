@@ -876,13 +876,39 @@ export function decideThreshold(
 }
 
 /**
- * Set the TUI footer pill, then prompt the user to allow/deny an operation.
- * Wraps ctx.ui.select() in try/finally so the pill clear always fires (user
- * answer, abort, or error). Blocked-notification transports track pi's core
- * ui_prompt_start/ui_prompt_end, which fire around ctx.ui.select.
+ * A FIFO promise queue for one-at-a-time execution: each task starts after the
+ * previous one settles, either outcome. The chain itself never rejects (each
+ * link swallows its own outcome), so one failed task can't poison later ones;
+ * value/rejection still propagate to each task's own caller.
+ */
+export function createConfirmQueue(): <T>(run: () => Promise<T>) => Promise<T> {
+	let chain: Promise<unknown> = Promise.resolve();
+	return function queueConfirm<T>(run: () => Promise<T>): Promise<T> {
+		const result = chain.then(run, run);
+		chain = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	};
+}
+
+// ctx.ui.select is a single-slot TUI resource: pi's showExtensionSelector
+// (1.0.0) disposes the previous selector when a new one arrives, orphaning its
+// promise — it can never settle unless the caller passed a timeout (the gate
+// doesn't). Parallel tool_call events (e.g. a codemode Promise.all over gated
+// calls) would therefore confirm concurrently and wedge the displaced handler
+// forever. All confirm paths funnel through confirmWithUser, so one
+// process-wide queue serializes the dialog: one confirm at a time, in arrival
+// order. Classification stays parallel — it's UI-free, and its latency win is
+// the gate's point.
+const queueConfirm = createConfirmQueue();
+
+/**
+ * Confirm an operation with the user, serialized behind any in-flight confirm.
  * Returns {block:true} on denial, undefined on allow.
  */
-async function confirmWithUser(
+function confirmWithUser(
 	ctx: ExtensionContext,
 	command: string,
 	displaySignature: string,
@@ -890,6 +916,34 @@ async function confirmWithUser(
 	opts: ConfirmOptions,
 	rawResponse?: string,
 ): Promise<{ block: true; reason: string } | undefined> {
+	return queueConfirm(() =>
+		confirmWithUserInner(ctx, command, displaySignature, blockLevel, opts, rawResponse),
+	);
+}
+
+/**
+ * Set the TUI footer pill, then prompt the user to allow/deny an operation.
+ * Wraps ctx.ui.select() in try/finally so the pill clear always fires (user
+ * answer, abort, or error). Blocked-notification transports track pi's core
+ * ui_prompt_start/ui_prompt_end, which fire around ctx.ui.select — the confirm
+ * queue keeps those spans strictly paired under parallel tool_call events.
+ * Returns {block:true} on denial, undefined on allow.
+ */
+async function confirmWithUserInner(
+	ctx: ExtensionContext,
+	command: string,
+	displaySignature: string,
+	blockLevel: RiskLevel,
+	opts: ConfirmOptions,
+	rawResponse?: string,
+): Promise<{ block: true; reason: string } | undefined> {
+	if (ctx.signal?.aborted) {
+		// Turn aborted while this confirm sat queued: settle now as a block —
+		// the same log/block outcome an aborted select produces (aborted
+		// selects resolve undefined), minus the pointless awaiting-input pill.
+		logCommandDecision(command, opts.risk, blockLevel, "blocked", opts.blockedLogReason, rawResponse, opts.logErrorDetail);
+		return { block: true, reason: opts.blockReason };
+	}
 	const icon = RISK_ICON[opts.risk];
 	const statusText = `🛡 gate: ${icon} awaiting input`;
 	try {

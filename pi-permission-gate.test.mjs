@@ -35,6 +35,7 @@ import extension, {
 	cacheKey,
 	cacheGetVerdict,
 	cachePutVerdict,
+	createConfirmQueue,
 	renderMcpCommand,
 	parseMcpToolName,
 	renderBuiltinMcpCommand,
@@ -538,7 +539,7 @@ describe("config plumbing", () => {
 	it("confirmWithUser threads rawResponse and logErrorDetail to its log calls", () => {
 		assert.match(
 			extensionSource,
-			/async function confirmWithUser\([\s\S]*?opts: ConfirmOptions,\s*\n\s*rawResponse\?: string,\s*\n\)/,
+			/function confirmWithUser\([\s\S]*?opts: ConfirmOptions,\s*\n\s*rawResponse\?: string,\s*\n\)/,
 		);
 		assert.match(
 			extensionSource,
@@ -849,7 +850,9 @@ describe("MCP input-shape robustness", () => {
 	});
 
 	it("meta-ops render as a verbatim input dump — no <unknown> placeholder, no per-mode switch", () => {
-		assert.doesNotMatch(extensionSource, /<unknown>/);
+		// Placeholder ban targets rendered string literals, not type annotations
+		// (e.g. Promise<unknown> in queue plumbing).
+		assert.doesNotMatch(extensionSource, /["'`]<unknown>["'`]/);
 		assert.match(extensionSource, /MCP gateway meta-op: input=\$\{JSON\.stringify\(input\)\}/);
 	});
 
@@ -1202,6 +1205,80 @@ describe("decideThreshold", () => {
 		// risk=low at blockLevel=low: 1 >= 1 → confirm path
 		assert.equal(a.kind, "confirm");
 		assert.equal(a.logRawResponse, false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Confirm serialization — parallel tool_call events must not confirm
+// concurrently: pi's extension selector is single-slot (showExtensionSelector
+// disposes the previous component, orphaning its promise), so a displaced
+// confirm would never settle and the awaiting tool_call handler wedges.
+// ---------------------------------------------------------------------------
+
+describe("createConfirmQueue", () => {
+	it("runs tasks one at a time, in arrival order (FIFO)", async () => {
+		const queue = createConfirmQueue();
+		const order = [];
+		let release1;
+		const gate1 = new Promise((resolve) => { release1 = resolve; });
+		const p1 = queue(async () => {
+			order.push("1-start");
+			await gate1;
+			order.push("1-end");
+			return "one";
+		});
+		const p2 = queue(async () => {
+			order.push("2");
+			return "two";
+		});
+		// A macrotask gives a broken (non-serializing) queue ample ticks to
+		// start task 2 while task 1 is still parked on gate1.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.deepEqual(order, ["1-start"]);
+		release1();
+		assert.equal(await p1, "one");
+		assert.equal(await p2, "two");
+		assert.deepEqual(order, ["1-start", "1-end", "2"]);
+	});
+
+	it("a rejected task doesn't poison the queue; later tasks still run", async () => {
+		const queue = createConfirmQueue();
+		const failing = queue(async () => {
+			throw new Error("boom");
+		});
+		const following = queue(async () => "two");
+		await assert.rejects(failing, /boom/);
+		assert.equal(await following, "two");
+	});
+
+	it("value and rejection propagate to each caller only", async () => {
+		const queue = createConfirmQueue();
+		const ok = queue(async () => "value");
+		assert.equal(await ok, "value");
+		const failing = queue(async () => {
+			throw new Error("caller-sees-this");
+		});
+		await assert.rejects(failing, /caller-sees-this/);
+	});
+});
+
+describe("confirm serialization plumbing", () => {
+	it("confirmWithUser routes through the process-wide queue", () => {
+		assert.match(extensionSource, /const queueConfirm = createConfirmQueue\(\);/);
+		assert.match(extensionSource, /return queueConfirm\(\(\) =>\s*\n\s*confirmWithUserInner\(/);
+	});
+
+	it("only the confirm phase is queued — classification stays parallel", () => {
+		const queuedCalls = extensionSource.match(/queueConfirm\(\(\) =>/g) ?? [];
+		assert.equal(queuedCalls.length, 1);
+		assert.match(extensionSource, /await classifyCommand\(/);
+	});
+
+	it("aborted turn fails a queued confirm fast (no pill, no select)", () => {
+		assert.match(
+			extensionSource,
+			/async function confirmWithUserInner[\s\S]{0,600}?if \(ctx\.signal\?\.aborted\) \{[\s\S]{0,600}?logCommandDecision/,
+		);
 	});
 });
 

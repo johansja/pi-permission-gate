@@ -35,7 +35,7 @@ Each `tool_call` for `bash`, for built-in MCP tools (names like `mcp__<server>__
 - **medium** — significant/external (`git push`, `kubectl apply`, `helm install`, `npm publish`, …) or credential disclosure — exposing live secrets into the transcript (`cat ~/.ssh/id_rsa`, `cat .env`, literal tokens in the command text) or shipping file contents off-host (`curl --post-file …`)
 - **high** — destructive/irreversible (`sudo`, `rm -rf /etc`, `DROP TABLE`, `git push --force`, `shutdown`, …)
 
-At or above `blockLevel` → confirm via TUI prompt (or block in headless). Below → allow. `safe` is always allowed even at `blockLevel=safe` (carve-out prevents threshold-0 false blocks).
+At or above `blockLevel` → confirm via TUI prompt (or block in headless). Below → allow. `safe` is always allowed even at `blockLevel=safe` (carve-out prevents threshold-0 false blocks). Parallel gated calls (e.g. a codemode script batching MCP writes) confirm one at a time, in arrival order — a second dialog never clobbers the first.
 
 CWD is passed to the model so `rm -rf ./build` is `low` but `rm -rf /etc` is `high` — no post-hoc heuristics.
 
